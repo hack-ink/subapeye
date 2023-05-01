@@ -11,6 +11,7 @@ pub enum Error {
 	Jsonrpc(#[from] Jsonrpc),
 	#[error(transparent)]
 	Generic(#[from] Generic),
+	// Move to Websocket error?
 	#[error(transparent)]
 	Tungstenite(#[from] tokio_tungstenite::tungstenite::Error),
 }
@@ -37,6 +38,8 @@ pub enum Jsonrpc {
 	ChannelClosed(#[from] ChannelClosed),
 	#[error("[jsonrpc] empty batch")]
 	EmptyBatch,
+	#[error("[jsonrpc] empty response")]
+	EmptyResponse,
 	#[error("[jsonrpc] exceeded the maximum number of request queue size, {0:?}")]
 	ExceededRequestQueueMaxSize(crate::jsonrpc::Id),
 	#[error("[jsonrpc] response error, {0:?}")]
@@ -51,8 +54,6 @@ pub enum Jsonrpc {
 pub enum ChannelClosed {
 	#[error("[jsonrpc] messenger channel closed")]
 	Messenger,
-	#[error("[jsonrpc] reporter channel closed")]
-	Reporter,
 	#[error("[jsonrpc] notifier channel closed")]
-	Notifier(#[from] tokio::sync::oneshot::error::RecvError),
+	Notifier,
 }

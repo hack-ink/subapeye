@@ -55,8 +55,6 @@ pub enum Generic {
 	// Codec(#[from] parity_scale_codec::Error),
 	#[error(transparent)]
 	Serde(#[from] serde_json::Error),
-	#[error(transparent)]
-	Submetadatan(#[from] submetadatan::Error),
 }
 /// Wrap the error with [`Generic::AlmostImpossible`].
 pub fn almost_impossible(e_msg: &'static str) -> Generic {

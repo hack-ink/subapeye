@@ -97,7 +97,7 @@ where
 
 		apeye.metadata =
 			submetadatan::unprefix_raw_metadata_minimal(apeye.get_metadata::<String>(None).await??)
-				.map_err(error::Generic::Submetadatan)?;
+				.expect("[apeye] failed to parse metadata");
 
 		#[cfg(feature = "trace")]
 		tracing::trace!("Metadata({:?})", apeye.metadata);

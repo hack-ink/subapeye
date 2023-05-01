@@ -62,6 +62,9 @@ type BatchResponse = Vec<RequestResponse>;
 type BatchNotifier = Notifier<BatchResponse>;
 type BatchPool = Pool<BatchNotifier>;
 
+const E_EMPTY_LOCK: &str = "[jsonrpc::ws] acquired `lock` is empty";
+const E_ID_NOT_FOUND: &str = "[jsonrpc::ws] id not found in the pool";
+
 /// A Ws instance.
 ///
 /// Use this to interact with the server.
@@ -111,7 +114,7 @@ impl Jsonrpc for Ws {
 		time::timeout(self.request_timeout, rx)
 			.await
 			.map_err(error::Jsonrpc::Timeout)?
-			.map_err(|e| error::Jsonrpc::from(error::ChannelClosed::Notifier(e)))?
+			.map_err(|_| error::Jsonrpc::from(error::ChannelClosed::Notifier))?
 	}
 
 	/// Send a batch of requests.
@@ -124,10 +127,7 @@ impl Jsonrpc for Ws {
 		}
 
 		let RequestQueueGuard { lock: ids, .. } = self.request_queue.consume(raw_requests.len())?;
-		let id = ids
-			.first()
-			.ok_or(error::almost_impossible("[jsonrpc::ws] acquired `lock` is empty"))?
-			.to_owned();
+		let id = ids.first().ok_or(error::almost_impossible(E_EMPTY_LOCK))?.to_owned();
 		let requests = ids
 			.into_iter()
 			.zip(raw_requests.into_iter())
@@ -148,7 +148,7 @@ impl Jsonrpc for Ws {
 		let mut responses = time::timeout(self.request_timeout, rx)
 			.await
 			.map_err(error::Jsonrpc::Timeout)?
-			.map_err(|e| error::Jsonrpc::from(error::ChannelClosed::Notifier(e)))?;
+			.map_err(|_| error::Jsonrpc::from(error::ChannelClosed::Notifier))?;
 		// Each id is unique.
 		let _ = responses.as_mut().map(|r| r.sort_unstable_by_key(|r| r.id()));
 
@@ -213,7 +213,7 @@ impl FutureSelector {
 						} else {
 							try_send(
 								error_tx,
-								error::Jsonrpc::from(error::ChannelClosed::Reporter).into(),
+								error::Jsonrpc::from(error::ChannelClosed::Notifier).into(),
 								false,
 							);
 
@@ -228,7 +228,11 @@ impl FutureSelector {
 						exit_or_interval_fut_,
 					)) => {
 						if let Some(response) = maybe_response {
-							pool.on_ws_recv(response).await.unwrap()
+							if let Err(e) = pool.on_response(response).await {
+								try_send(error_tx, e, true);
+
+								return;
+							}
 						} else {
 							// TODO?: closed
 						}
@@ -241,15 +245,11 @@ impl FutureSelector {
 						#[cfg(feature = "trace")]
 						tracing::trace!("Tick(Ping)");
 
-						if ws_tx.send(Message::Text("Ping".into())).await.is_err() {
-							try_send(
-								error_tx,
-								error::Jsonrpc::from(error::ChannelClosed::Reporter).into(),
-								false,
-							);
+						if let Err(e) = ws_tx.send(Message::Ping(Vec::new())).await {
+							try_send(error_tx, e.into(), false);
 
 							return;
-						}
+						};
 
 						rxs_fut = rxs_fut_;
 						exit_or_interval_fut = future::select(
@@ -295,14 +295,18 @@ impl FutureSelector {
 								return;
 							}
 						} else {
-							try_send(error_tx, error::Jsonrpc::from(error::ChannelClosed::Reporter).into(), false);
+							try_send(error_tx, error::Jsonrpc::from(error::ChannelClosed::Notifier).into(), false);
 
 							return;
 						}
 					},
 					maybe_response = ws_rx.next() => {
 						if let Some(response) = maybe_response {
-							pool.on_ws_recv(response).await.unwrap()
+							if let Err(e) = pool.on_response(response).await {
+								try_send(error_tx, e, true);
+
+								return;
+							}
 						} else {
 							// TODO?: closed
 						}
@@ -311,8 +315,8 @@ impl FutureSelector {
 						#[cfg(feature = "trace")]
 						tracing::trace!("Tick(Ping)");
 
-						if ws_tx.send(Message::Ping(Vec::new())).await.is_err() {
-							try_send(error_tx, error::Jsonrpc::from(error::ChannelClosed::Reporter).into(), false);
+						if let Err(e) = ws_tx.send(Message::Ping(Vec::new())).await {
+							try_send(error_tx, e.into(), false);
 
 							return
 						};
@@ -411,55 +415,62 @@ impl Pools {
 		Default::default()
 	}
 
-	async fn on_ws_recv(&mut self, response: WsResult<Message>) -> Result<()> {
+	async fn on_response(&mut self, response: WsResult<Message>) -> Result<()> {
 		match response {
-			Ok(msg) => {
-				match msg {
-					Message::Binary(r) => self.process_response(&r).await,
-					Message::Text(r) => self.process_response(r.as_bytes()).await,
-					Message::Ping(_) => tracing::trace!("ping"),
-					Message::Pong(_) => tracing::trace!("pong"),
-					Message::Close(_) => tracing::trace!("close"),
-					Message::Frame(_) => tracing::trace!("frame"),
-				}
+			Ok(m) => match m {
+				Message::Binary(r) => self.process_response(&r).await,
+				Message::Text(r) => self.process_response(r.as_bytes()).await,
+				Message::Ping(_) => {
+					tracing::trace!("ping");
 
-				Ok(())
+					Ok(())
+				},
+				Message::Pong(_) => {
+					tracing::trace!("pong");
+
+					Ok(())
+				},
+				Message::Close(_) => {
+					tracing::trace!("close");
+
+					Ok(())
+				},
+				Message::Frame(_) => {
+					tracing::trace!("frame");
+
+					Ok(())
+				},
 			},
 			Err(e) => Err(e)?,
 		}
 	}
 
-	// TODO: error handling
-	async fn process_response(&mut self, response: &[u8]) {
+	async fn process_response(&mut self, response: &[u8]) -> Result<()> {
 		#[cfg(feature = "trace")]
 		tracing::trace!("Response({response:?})");
 
 		let response = response.trim_ascii_start();
-		let Some(first) = response.first() else {
-			tracing::error!("[jsonrpc::ws] empty response");
-
-			return;
-		};
+		let first = response.first().ok_or(error::Jsonrpc::EmptyResponse)?;
 
 		match first {
 			b'{' =>
 				if let Ok(r) = serde_json::from_slice::<ResponseResult>(response) {
-					let notifier = self.requests.remove(&r.id).unwrap();
+					try_take_notifier(&mut self.requests, &r.id)?
+						.send(Ok(Ok(r)))
+						.map_err(|_| error::Jsonrpc::from(error::ChannelClosed::Notifier))?;
 
-					if let Err(e) = notifier.send(Ok(Ok(r))) {
-						tracing::error!("{e:?}");
-					}
+					return Ok(());
 				} else if let Ok(e) = serde_json::from_slice::<ResponseError>(response) {
 					// E.g.
 					// ```
 					// Response({"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":2})
 					// ```
 
-					let notifier = self.requests.remove(&e.id).unwrap();
+					try_take_notifier(&mut self.requests, &e.id)?
+						.send(Ok(Err(e)))
+						.map_err(|_| error::Jsonrpc::from(error::ChannelClosed::Notifier))?;
 
-					if let Err(e) = notifier.send(Ok(Err(e))) {
-						tracing::error!("{e:?}");
-					}
+					return Ok(());
 				},
 			b'[' =>
 				if let Ok(r) = serde_json::from_slice::<Vec<&RawValue>>(response) {
@@ -474,19 +485,24 @@ impl Pools {
 								Err(error::almost_impossible("TODO"))?
 							}
 						})
-						.collect::<Result<Vec<JsonrpcResult>>>()
-						.unwrap();
+						.collect::<Result<Vec<JsonrpcResult>>>()?;
 
-					let notifier = self.batches.remove(&r.first().unwrap().id()).unwrap();
+					try_take_notifier(
+						&mut self.batches,
+						&r.first().ok_or(error::Jsonrpc::EmptyBatch)?.id(),
+					)?
+					.send(Ok(r))
+					.map_err(|_| error::Jsonrpc::from(error::ChannelClosed::Notifier))?;
 
-					if let Err(e) = notifier.send(Ok(r)) {
-						tracing::error!("{e:?}");
-					}
+					return Ok(());
 				},
-			_ => {
-				tracing::error!("unable to process response, {response:?}");
-				// TODO: return
-			},
+			_ => (),
 		}
+
+		Err(error::almost_impossible("[jsonrpc::ws] unable to process response, {response:?}"))?
 	}
+}
+
+fn try_take_notifier<T>(pool: &mut Pool<Notifier<T>>, id: &Id) -> Result<Notifier<T>> {
+	Ok(pool.remove(id).ok_or_else(|| error::almost_impossible(E_ID_NOT_FOUND))?)
 }
