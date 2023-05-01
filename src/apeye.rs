@@ -29,7 +29,7 @@ pub trait Invoker: Send + Sync {
 	where
 		R: DeserializeOwned,
 	{
-		Ok(r.map_err(|e| error::Jsonrpc::ResponseError(e.error))?)
+		Ok(r.map_err(|e| error::Net::JsonrpcResponse(e.error))?)
 			.and_then(|r| Ok(serde_json::from_value::<R>(r.result).map_err(error::Generic::Serde)?))
 	}
 
@@ -55,7 +55,7 @@ where
 		Req: IntoRequestRaw<'a>,
 		R: DeserializeOwned,
 	{
-		self.request(raw_request).await.map(Self::map_result)
+		Ok(self.request(raw_request).await.map_err(error::Net::Jsonrpc)?).map(Self::map_result)
 	}
 
 	async fn batch<'a, Req, R>(&self, raw_requests: Vec<Req>) -> Result<Vec<Result<R>>>
@@ -63,7 +63,8 @@ where
 		Req: IntoRequestRaw<'a>,
 		R: DeserializeOwned,
 	{
-		self.batch(raw_requests).await.map(|v| v.into_iter().map(Self::map_result).collect())
+		Ok(self.batch(raw_requests).await.map_err(error::Net::Jsonrpc)?)
+			.map(|v| v.into_iter().map(Self::map_result).collect())
 	}
 }
 
@@ -91,7 +92,7 @@ where
 	where
 		Iz: Initialize<Connection = I>,
 	{
-		let invoker = Arc::new(initializer.initialize().await?);
+		let invoker = Arc::new(initializer.initialize().await.map_err(error::Net::Jsonrpc)?);
 		let mut apeye = Self { invoker, metadata: Default::default(), runtime: Default::default() };
 
 		apeye.metadata =

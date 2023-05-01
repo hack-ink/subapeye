@@ -1,5 +1,6 @@
 //! Subapeye error collections.
 
+// crates.io
 use thiserror::Error as ThisError;
 
 /// Main error.
@@ -14,11 +15,7 @@ pub enum Error {
 	#[error(transparent)]
 	Generic(#[from] Generic),
 	#[error(transparent)]
-	Jsonrpc(#[from] Jsonrpc),
-	#[error(transparent)]
-	Tokio(#[from] Tokio),
-	#[error(transparent)]
-	Tungstenite(#[from] tokio_tungstenite::tungstenite::Error),
+	Net(#[from] Net),
 }
 
 /// An error helper/wrapper to debug/print the error quickly.
@@ -69,24 +66,9 @@ pub fn almost_impossible(e_msg: &'static str) -> Generic {
 /// JSONRPC error.
 #[allow(missing_docs)]
 #[derive(Debug, ThisError)]
-pub enum Jsonrpc {
-	#[error("[jsonrpc] empty batch")]
-	EmptyBatch,
-	#[error("[jsonrpc] exceeded the maximum number of request queue size, {0:?}")]
-	ExceededRequestQueueMaxSize(crate::jsonrpc::Id),
+pub enum Net {
+	#[error(transparent)]
+	Jsonrpc(#[from] crate::jsonrpc::Error),
 	#[error("[jsonrpc] response error, {0:?}")]
-	ResponseError(serde_json::Value),
-}
-
-/// Tokio error.
-#[allow(missing_docs)]
-#[derive(Debug, ThisError)]
-pub enum Tokio {
-	#[error(transparent)]
-	OneshotRecv(tokio::sync::oneshot::error::RecvError),
-	// e.g. https://github.com/tokio-rs/tokio/blob/master/tokio/src/sync/mpsc/error.rs#L12
-	#[error("channel closed")]
-	ChannelClosed,
-	#[error(transparent)]
-	Elapsed(tokio::time::error::Elapsed),
+	JsonrpcResponse(serde_json::Value),
 }

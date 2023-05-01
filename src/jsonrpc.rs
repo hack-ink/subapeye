@@ -1,7 +1,22 @@
-//! Subapeye core JSONRPC library.
+//! JSONRPC client library.
 
 pub mod ws;
 pub use ws::{Ws, WsInitializer};
+
+pub mod error;
+pub use error::Error;
+
+pub mod prelude {
+	//! JSONRPC prelude.
+
+	pub use std::result::Result as StdResult;
+
+	pub use crate::jsonrpc::error::{self, Error};
+
+	/// Subapeye's `Result` type.
+	pub type Result<T> = StdResult<T, Error>;
+}
+use prelude::*;
 
 // std
 use std::sync::{
@@ -11,8 +26,6 @@ use std::sync::{
 // crates.io
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-// subapeye
-use crate::prelude::*;
 
 /// JSONRPC Id.
 pub type Id = usize;
@@ -89,7 +102,7 @@ impl Response for JsonrpcResult {
 	// 			id: r.id,
 	// 			result: serde_json::to_value(r.result).map_err(error::Generic::Serde)?,
 	// 		}),
-	// 		Self::Err(e) => Self::Err(ResponseError {
+	// 		Self::Err(e) => Self::Err(Response {
 	// 			jsonrpc: e.jsonrpc,
 	// 			id: e.id,
 	// 			error: serde_json::to_value(e.error).map_err(error::Generic::Serde)?,
@@ -147,6 +160,10 @@ struct RequestQueue {
 	next: AtomicUsize,
 }
 impl RequestQueue {
+	fn with_size(size: Id) -> Self {
+		Self { size, active: Default::default(), next: Default::default() }
+	}
+
 	fn consume_once(&self) -> Result<RequestQueueGuard<Id>> {
 		let active = Arc::strong_count(&self.active);
 

@@ -1,3 +1,5 @@
+use std::error::Error;
+
 use array_bytes::TryFromHex;
 use serde_json::Value;
 use subapeye::{
@@ -7,7 +9,7 @@ use subapeye::{
 use subrpcer::{chain, net};
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn Error>> {
 	tracing_subscriber::fmt::init();
 
 	enum R {}
@@ -19,53 +21,41 @@ async fn main() {
 
 	let apeye =
 		<Apeye<_, R>>::initialize(WsInitializer::default().uri("wss://kusama-rpc.polkadot.io"))
-			.await
-			.unwrap();
+			.await?;
 
-	// let hashes = apeye.get_block_hash::<_, Vec<String>>(Some([0, 1, 2])).await.unwrap();
+	for h in apeye.get_block_hash::<_, Vec<String>>(Some([0, 1, 2])).await?? {
+		dbg!(apeye.get_block::<Value>(Some(&h)).await??);
+		dbg!(apeye.get_header::<Value>(Some(&h)).await??);
+	}
 
-	// dbg!(hashes);
+	dbg!(apeye.get_finalized_head::<String>().await??);
+	dbg!(apeye.query::<String>(&apeye.query_of::<()>("System", "Number")?.construct()?).await??);
+	dbg!(
+		apeye
+			.query::<Value>(
+				&apeye
+					.query_of("Staking", "ErasValidatorPrefs")?
+					.keys(Keys::Raw(&(
+						5_044_u32,
+						<R as Runtime>::AccountId::try_from_hex(
+							"0x305b1689cfee594c19a642a2fcd554074c93d62181c0d4117ebe196bd7c62b79"
+						)
+						.unwrap()
+					)))
+					.construct()?
+			)
+			.await??
+	);
+	dbg!(
+		apeye
+			.batch::<_, Value>(vec![
+				chain::get_block_hash_raw(<Option<()>>::None),
+				chain::get_finalized_head_raw(),
+				net::version_raw(),
+			])
+			.await?
+	);
+	dbg!(apeye.version::<Value>().await??);
 
-	// for h in hashes {
-	// 	dbg!(apeye.get_block::<Value>(Some(&h)).await.unwrap());
-	// 	dbg!(apeye.get_header::<Value>(Some(&h)).await.unwrap());
-	// }
-
-	// dbg!(apeye.get_finalized_head::<String>().await.unwrap());
-	// dbg!(apeye.get_metadata::<String>(None).await.unwrap());
-
-	// dbg!(apeye
-	// 	.query::<String>(&apeye.query_of::<()>("System", "Number").unwrap().construct().unwrap())
-	// 	.await
-	// 	.unwrap());
-	dbg!(apeye
-		.query::<Value>(
-			&apeye
-				.query_of("Staking", "ErasValidatorPrefs")
-				.unwrap()
-				.keys(Keys::Raw(&(
-					5_044_u32,
-					<R as Runtime>::AccountId::try_from_hex(
-						"0x305b1689cfee594c19a642a2fcd554074c93d62181c0d4117ebe196bd7c62b79"
-					)
-					.unwrap()
-				)))
-				.construct()
-				.unwrap()
-		)
-		.await
-		.unwrap()
-		.unwrap());
-
-	let v = apeye
-		.batch::<_, Value>(vec![
-			chain::get_block_hash_raw(<Option<()>>::None),
-			chain::get_finalized_head_raw(),
-			net::version_raw(),
-		])
-		.await
-		.unwrap();
-	dbg!(v);
-
-	dbg!(apeye.version::<Value>().await.unwrap());
+	Ok(())
 }
