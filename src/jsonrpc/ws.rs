@@ -5,23 +5,17 @@ pub mod initializer;
 pub use initializer::*;
 
 // std
-use std::{fmt::Debug, future::Future, pin::Pin, time::Duration};
+use std::{mem, time::Duration};
 // crates.io
 use futures::{
 	future::{self, Either, Fuse},
 	stream::{self, SplitSink, SplitStream},
 	FutureExt, SinkExt, StreamExt,
 };
-use fxhash::FxHashMap;
-use serde_json::value::RawValue;
-use tokio::{
-	net::TcpStream,
-	sync::{mpsc, oneshot},
-	time,
-};
+use tokio::{net::TcpStream, sync::Mutex, time};
 use tokio_stream::wrappers::IntervalStream;
 use tokio_tungstenite::{
-	tungstenite::{error::Result as WsResult, Message},
+	tungstenite::{error::Result as WsResult, Message as WsMessage},
 	MaybeTlsStream, WebSocketStream,
 };
 // subapeye
@@ -32,49 +26,54 @@ type GenericConnect = Box<
 			Duration,
 			WsSender,
 			WsReceiver,
-			CallReceiver,
-			ErrorSender,
-			ExitReceiver,
+			MessageRx,
+			ErrorTx,
+			ExitRx,
 		) -> Pin<Box<dyn Future<Output = ()> + Send>>
 		+ Send,
 >;
 
-type CallSender = mpsc::Sender<Call>;
-type CallReceiver = mpsc::Receiver<Call>;
-
-type WsSender = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+type WsSender = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
 type WsReceiver = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
-
-type ErrorSender = oneshot::Sender<Error>;
-type ErrorReceiver = oneshot::Receiver<Error>;
-
-type ExitSender = oneshot::Sender<()>;
-type ExitReceiver = oneshot::Receiver<()>;
-
-type Notifier<T> = oneshot::Sender<Result<T>>;
-type Pool<T> = FxHashMap<Id, T>;
-
-type RequestResponse = JsonrpcResult;
-type RequestNotifier = Notifier<RequestResponse>;
-type RequestPool = Pool<RequestNotifier>;
-
-type BatchResponse = Vec<RequestResponse>;
-type BatchNotifier = Notifier<BatchResponse>;
-type BatchPool = Pool<BatchNotifier>;
-
-const E_EMPTY_LOCK: &str = "[jsonrpc::ws] acquired `lock` is empty";
-const E_ID_NOT_FOUND: &str = "[jsonrpc::ws] id not found in the pool";
 
 /// A Ws instance.
 ///
 /// Use this to interact with the server.
 #[derive(Debug)]
 pub struct Ws {
-	messenger: CallSender,
+	messenger: MessageTx,
 	request_queue: RequestQueue,
 	request_timeout: Duration,
-	reporter: Option<ErrorReceiver>,
-	closer: Option<ExitSender>,
+	reporter: Mutex<StdResult<ErrorRx, String>>,
+	closer: Option<ExitTx>,
+}
+impl Ws {
+	// Don't call this if code hasn't encountered any error yet,
+	// as it will block the asynchronous process.
+	async fn report(&self) -> Result<()> {
+		let mut reporter = self.reporter.lock().await;
+		let e = match mem::replace(
+			&mut *reporter,
+			Err("[jsonrpc::ws] temporary error placeholder".into()),
+		) {
+			Ok(r) => r
+				.await
+				.map_err(|_| error::almost_impossible(E_REPORTER_CHANNEL_CLOSED))?
+				.to_string(),
+			Err(e) => e,
+		};
+
+		*reporter = Err(e.clone());
+
+		Err(error::Generic::Plain(e))?
+	}
+
+	async fn execute<F>(&self, future: F) -> Result<<F as Future>::Output>
+	where
+		F: Future,
+	{
+		Ok(time::timeout(self.request_timeout, future).await.map_err(error::Generic::Timeout)?)
+	}
 }
 impl Drop for Ws {
 	fn drop(&mut self) {
@@ -88,39 +87,42 @@ impl Drop for Ws {
 #[async_trait::async_trait]
 impl Jsonrpc for Ws {
 	/// Send a single request.
-	async fn request<'a, Req>(&self, raw_request: Req) -> Result<JsonrpcResult>
+	async fn request<'a, R>(&self, raw_request: R) -> Result<ResponseResult>
 	where
-		Req: Send + Into<RequestRaw<'a, Value>>,
+		R: IntoRequestRaw<'a>,
 	{
 		let RequestQueueGuard { lock: id, .. } = self.request_queue.consume_once()?;
 		let RequestRaw { method, params } = raw_request.into();
 		let (tx, rx) = oneshot::channel();
 
 		#[cfg(feature = "debug")]
-		self.messenger
-			.send(Call::Debug(id))
-			.await
-			.map_err(|_| error::Jsonrpc::from(error::ChannelClosed::Messenger))?;
-		self.messenger
-			.send(Call::Single(CallInner {
+		if self.messenger.send(Message::Debug(id)).await.is_err() {
+			self.report().await?;
+		}
+		if self
+			.messenger
+			.send(Message::Request(Call {
 				id,
 				request: serde_json::to_string(&Request { jsonrpc: VERSION, id, method, params })
 					.map_err(error::Generic::Serde)?,
-				notifier: tx,
+				tx,
 			}))
 			.await
-			.map_err(|_| error::Jsonrpc::from(error::ChannelClosed::Messenger))?;
-
-		time::timeout(self.request_timeout, rx)
-			.await
-			.map_err(error::Jsonrpc::Timeout)?
-			.map_err(|_| error::Jsonrpc::from(error::ChannelClosed::Notifier))?
+			.is_err()
+		{
+			self.report().await?;
+		}
+		if let Ok(r) = self.execute(rx).await? {
+			r
+		} else {
+			self.report().await.and(Err(error::almost_impossible(E_NO_ERROR))?)?
+		}
 	}
 
 	/// Send a batch of requests.
-	async fn batch<'a, Req>(&self, raw_requests: Vec<Req>) -> Result<Vec<JsonrpcResult>>
+	async fn batch<'a, R>(&self, raw_requests: Vec<R>) -> Result<Vec<ResponseResult>>
 	where
-		Req: Send + Into<RequestRaw<'a, Value>>,
+		R: IntoRequestRaw<'a>,
 	{
 		if raw_requests.is_empty() {
 			Err(error::Jsonrpc::EmptyBatch)?;
@@ -140,19 +142,45 @@ impl Jsonrpc for Ws {
 		let request = serde_json::to_string(&requests).map_err(error::Generic::Serde)?;
 		let (tx, rx) = oneshot::channel();
 
-		self.messenger
-			.send(Call::Batch(CallInner { id, request, notifier: tx }))
-			.await
-			.map_err(|_| error::Jsonrpc::from(error::ChannelClosed::Messenger))?;
+		if self.messenger.send(Message::Batch(Call { id, request, tx })).await.is_err() {
+			self.report().await?;
+		}
+		if let Ok(mut r) = self.execute(rx).await? {
+			// Each id is unique.
+			let _ = r.as_mut().map(|r| r.sort_unstable_by_key(|r| r.id()));
 
-		let mut responses = time::timeout(self.request_timeout, rx)
-			.await
-			.map_err(error::Jsonrpc::Timeout)?
-			.map_err(|_| error::Jsonrpc::from(error::ChannelClosed::Notifier))?;
-		// Each id is unique.
-		let _ = responses.as_mut().map(|r| r.sort_unstable_by_key(|r| r.id()));
+			r
+		} else {
+			self.report().await.and(Err(error::almost_impossible(E_NO_ERROR))?)?
+		}
+	}
 
-		responses
+	async fn subscribe<'a, R, M, D>(
+		&self,
+		raw_request: R,
+		unsubscribe_method: M,
+	) -> Result<Subscriber<'a, Self, R, D>>
+	where
+		R: IntoRequestRaw<'a>,
+		M: Send + AsRef<str>,
+	{
+		let id = self
+			.request(raw_request)
+			.await?
+			.extract_err()?
+			.result
+			.as_str()
+			.ok_or(error::Jsonrpc::InvalidSubscriptionId)?
+			.to_owned();
+		// TODO?: Configurable channel size.
+		let (tx, rx) = mpsc::channel(self.request_queue.size);
+
+		if self.messenger.send(Message::Subscription(Subscription { id, tx })).await.is_err() {
+			self.report().await?;
+		}
+
+		todo!()
+		// Ok(Subscriber { message_tx: tx, subscription_rx: rx })
 	}
 }
 
@@ -176,16 +204,17 @@ impl FutureSelector {
 		interval: Duration,
 		mut ws_tx: WsSender,
 		mut ws_rx: WsReceiver,
-		call_rx: CallReceiver,
-		error_tx: ErrorSender,
-		exit_rx: ExitReceiver,
+		message_rx: MessageRx,
+		error_tx: ErrorTx,
+		exit_rx: ExitRx,
 	) -> Pin<Box<dyn Future<Output = ()> + Send>> {
 		Box::pin(async move {
-			let call_rx = stream::unfold(call_rx, |mut r| async { r.recv().await.map(|c| (c, r)) });
+			let message_rx =
+				stream::unfold(message_rx, |mut r| async { r.recv().await.map(|m| (m, r)) });
 
-			futures::pin_mut!(call_rx);
+			futures::pin_mut!(message_rx);
 
-			let mut rxs_fut = future::select(call_rx.next(), ws_rx.next());
+			let mut rxs_fut = future::select(message_rx.next(), ws_rx.next());
 			// TODO: clean dead items?
 			let mut pool = Pools::new();
 			// Minimum interval is 1ms.
@@ -200,27 +229,20 @@ impl FutureSelector {
 			loop {
 				match future::select(rxs_fut, exit_or_interval_fut).await {
 					Either::Left((
-						Either::Left((maybe_call, ws_rx_next)),
+						Either::Left((maybe_message, ws_rx_next)),
 						exit_or_interval_fut_,
 					)) => {
-						if let Some(c) = maybe_call {
-							#[cfg(feature = "trace")]
-							tracing::trace!("Call({c:?})");
-
-							if !c.try_send(&mut ws_tx, &mut pool).await {
-								return;
-							}
-						} else {
-							try_send(
-								error_tx,
-								error::Jsonrpc::from(error::ChannelClosed::Notifier).into(),
-								false,
-							);
-
+						if !pool
+							.on_message_ws(
+								maybe_message.expect(E_MESSAGE_CHANNEL_CLOSED),
+								&mut ws_tx,
+							)
+							.await
+						{
 							return;
 						}
 
-						rxs_fut = future::select(call_rx.next(), ws_rx_next);
+						rxs_fut = future::select(message_rx.next(), ws_rx_next);
 						exit_or_interval_fut = exit_or_interval_fut_;
 					},
 					Either::Left((
@@ -228,13 +250,15 @@ impl FutureSelector {
 						exit_or_interval_fut_,
 					)) => {
 						if let Some(response) = maybe_response {
-							if let Err(e) = pool.on_response(response).await {
+							if let Err(e) = pool.on_response_ws(response).await {
 								try_send(error_tx, e, true);
 
 								return;
 							}
 						} else {
-							// TODO?: closed
+							try_send(error_tx, error::Websocket::Closed.into(), true);
+
+							return;
 						}
 
 						rxs_fut = future::select(call_rx_next, ws_rx.next());
@@ -245,8 +269,8 @@ impl FutureSelector {
 						#[cfg(feature = "trace")]
 						tracing::trace!("Tick(Ping)");
 
-						if let Err(e) = ws_tx.send(Message::Ping(Vec::new())).await {
-							try_send(error_tx, e.into(), false);
+						if let Err(e) = ws_tx.send(WsMessage::Ping(Vec::new())).await {
+							try_send(error_tx, error::Websocket::Tungstenite(e).into(), false);
 
 							return;
 						};
@@ -270,9 +294,9 @@ impl FutureSelector {
 		interval: Duration,
 		mut ws_tx: WsSender,
 		mut ws_rx: WsReceiver,
-		mut call_rx: CallReceiver,
-		error_tx: ErrorSender,
-		mut exit_rx: ExitReceiver,
+		mut message_rx: MessageRx,
+		error_tx: ErrorTx,
+		mut exit_rx: ExitRx,
 	) -> Pin<Box<dyn Future<Output = ()> + Send>> {
 		Box::pin(async move {
 			// TODO: clean dead items?
@@ -286,37 +310,30 @@ impl FutureSelector {
 
 			loop {
 				tokio::select! {
-					maybe_request = call_rx.recv() => {
-						if let Some(c) = maybe_request {
-							#[cfg(feature = "trace")]
-							tracing::trace!("Call({c:?})");
-
-							if !c.try_send(&mut ws_tx, &mut pool).await {
-								return;
-							}
-						} else {
-							try_send(error_tx, error::Jsonrpc::from(error::ChannelClosed::Notifier).into(), false);
-
+					maybe_message = message_rx.recv() => {
+						if !pool.on_message_ws(maybe_message.expect(E_MESSAGE_CHANNEL_CLOSED), &mut ws_tx).await {
 							return;
 						}
 					},
 					maybe_response = ws_rx.next() => {
 						if let Some(response) = maybe_response {
-							if let Err(e) = pool.on_response(response).await {
+							if let Err(e) = pool.on_response_ws(response).await {
 								try_send(error_tx, e, true);
 
 								return;
 							}
 						} else {
-							// TODO?: closed
+							try_send(error_tx, error::Websocket::Closed.into(), true);
+
+							return;
 						}
 					}
 					_ = &mut interval_fut => {
 						#[cfg(feature = "trace")]
 						tracing::trace!("Tick(Ping)");
 
-						if let Err(e) = ws_tx.send(Message::Ping(Vec::new())).await {
-							try_send(error_tx, e.into(), false);
+						if let Err(e) = ws_tx.send(WsMessage::Ping(Vec::new())).await {
+							try_send(error_tx, error::Websocket::Tungstenite(e).into(), false);
 
 							return
 						};
@@ -337,172 +354,75 @@ impl Default for FutureSelector {
 	}
 }
 
-#[derive(Debug)]
-enum Call {
-	#[cfg(feature = "debug")]
-	Debug(Id),
-	Single(CallInner<RequestResponse>),
-	Batch(CallInner<BatchResponse>),
-}
-impl Call {
-	async fn try_send(self, ws_tx: &mut WsSender, pool: &mut Pools) -> bool {
-		match self {
-			#[cfg(feature = "debug")]
-			Call::Debug(_) => {},
-			Call::Single(c) =>
-				if !c.try_send(ws_tx, &mut pool.requests).await {
-					return false;
-				},
-			Call::Batch(c) =>
-				if !c.try_send(ws_tx, &mut pool.batches).await {
-					return false;
-				},
-		}
-
-		true
-	}
-}
-// A single request object.
-// `id`: Request Id.
-//
-// Or
-//
-// A batch requests object to send several request objects simultaneously.
-// `id`: The first request's id.
-#[derive(Debug)]
-struct CallInner<T> {
-	id: Id,
-	request: String,
-	notifier: Notifier<T>,
-}
-impl<T> CallInner<T>
+impl<T> Call<T>
 where
 	T: Debug,
 {
-	async fn try_send(self, ws_tx: &mut WsSender, pool: &mut Pool<Notifier<T>>) -> bool {
-		if let Err(e) = ws_tx.send(Message::Text(self.request)).await {
-			try_send(self.notifier, Err(e.into()), true)
+	async fn try_send_ws(self, tx: &mut WsSender, pool: &mut Pool<Id, ResponseTx<T>>) -> bool {
+		if let Err(e) = tx.send(WsMessage::Text(self.request)).await {
+			try_send(self.tx, Err(error::Websocket::Tungstenite(e).into()), true)
 		} else {
-			pool.insert(self.id, self.notifier);
+			pool.insert(self.id, self.tx);
 
 			true
 		}
 	}
 }
 
-fn try_send<T>(tx: oneshot::Sender<T>, any: T, log: bool) -> bool
-where
-	T: Debug,
-{
-	if let Err(e) = tx.send(any) {
-		if log {
-			tracing::error!("[jsonrpc::ws] failed to send error to outside, {e:?}");
+impl Pools {
+	async fn on_message_ws(&mut self, message: Message, tx: &mut WsSender) -> bool {
+		#[cfg(feature = "trace")]
+		tracing::trace!("Message({message:?})");
+
+		match message {
+			#[cfg(feature = "debug")]
+			Message::Debug(_) => {},
+			Message::Request(c) =>
+				if !c.try_send_ws(tx, &mut self.requests).await {
+					return false;
+				},
+			Message::Batch(c) =>
+				if !c.try_send_ws(tx, &mut self.batches).await {
+					return false;
+				},
+			Message::Subscription(s) => {
+				self.subscriptions.insert(s.id, s.tx);
+			},
 		}
 
-		return false;
+		true
 	}
 
-	true
-}
+	async fn on_response_ws(&mut self, response: WsResult<WsMessage>) -> Result<()> {
+		#[cfg(feature = "trace")]
+		tracing::trace!("Response({response:?})");
 
-#[derive(Debug, Default)]
-struct Pools {
-	requests: RequestPool,
-	batches: BatchPool,
-}
-impl Pools {
-	fn new() -> Self {
-		Default::default()
-	}
-
-	async fn on_response(&mut self, response: WsResult<Message>) -> Result<()> {
 		match response {
 			Ok(m) => match m {
-				Message::Binary(r) => self.process_response(&r).await,
-				Message::Text(r) => self.process_response(r.as_bytes()).await,
-				Message::Ping(_) => {
+				WsMessage::Binary(r) => self.process_response(&r).await,
+				WsMessage::Text(r) => self.process_response(r.as_bytes()).await,
+				WsMessage::Ping(_) => {
 					tracing::trace!("ping");
 
 					Ok(())
 				},
-				Message::Pong(_) => {
+				WsMessage::Pong(_) => {
 					tracing::trace!("pong");
 
 					Ok(())
 				},
-				Message::Close(_) => {
+				WsMessage::Close(_) => {
 					tracing::trace!("close");
 
 					Ok(())
 				},
-				Message::Frame(_) => {
+				WsMessage::Frame(_) => {
 					tracing::trace!("frame");
 
 					Ok(())
 				},
 			},
-			Err(e) => Err(e)?,
+			Err(e) => Err(error::Websocket::Tungstenite(e))?,
 		}
 	}
-
-	async fn process_response(&mut self, response: &[u8]) -> Result<()> {
-		#[cfg(feature = "trace")]
-		tracing::trace!("Response({response:?})");
-
-		let response = response.trim_ascii_start();
-		let first = response.first().ok_or(error::Jsonrpc::EmptyResponse)?;
-
-		match first {
-			b'{' =>
-				if let Ok(r) = serde_json::from_slice::<ResponseResult>(response) {
-					try_take_notifier(&mut self.requests, &r.id)?
-						.send(Ok(Ok(r)))
-						.map_err(|_| error::Jsonrpc::from(error::ChannelClosed::Notifier))?;
-
-					return Ok(());
-				} else if let Ok(e) = serde_json::from_slice::<ResponseError>(response) {
-					// E.g.
-					// ```
-					// Response({"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":2})
-					// ```
-
-					try_take_notifier(&mut self.requests, &e.id)?
-						.send(Ok(Err(e)))
-						.map_err(|_| error::Jsonrpc::from(error::ChannelClosed::Notifier))?;
-
-					return Ok(());
-				},
-			b'[' =>
-				if let Ok(r) = serde_json::from_slice::<Vec<&RawValue>>(response) {
-					let r = r
-						.into_iter()
-						.map(|r| {
-							if let Ok(r) = serde_json::from_str::<ResponseResult>(r.get()) {
-								Ok(Ok(r))
-							} else if let Ok(r) = serde_json::from_str::<ResponseError>(r.get()) {
-								Ok(Err(r))
-							} else {
-								Err(error::almost_impossible("TODO"))?
-							}
-						})
-						.collect::<Result<Vec<JsonrpcResult>>>()?;
-
-					try_take_notifier(
-						&mut self.batches,
-						&r.first().ok_or(error::Jsonrpc::EmptyBatch)?.id(),
-					)?
-					.send(Ok(r))
-					.map_err(|_| error::Jsonrpc::from(error::ChannelClosed::Notifier))?;
-
-					return Ok(());
-				},
-			_ => (),
-		}
-
-		Err(error::almost_impossible("[jsonrpc::ws] unable to process response, {response:?}"))?
-	}
-}
-
-fn try_take_notifier<T>(pool: &mut Pool<Notifier<T>>, id: &Id) -> Result<Notifier<T>> {
-	Ok(pool.remove(id).ok_or_else(|| error::almost_impossible(E_ID_NOT_FOUND))?)
 }

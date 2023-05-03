@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use submetadatan::{Meta, Metadata, StorageEntry};
 // subapeye
 use crate::{
-	jsonrpc::{Connection, Initialize, IntoRequestRaw, JsonrpcResult},
+	jsonrpc::{Connection, Initialize, IntoRequestRaw, ResponseResult, ResultExt, Subscriber},
 	prelude::*,
 };
 
@@ -25,46 +25,73 @@ impl<T> Layer for T where T: Invoker + Runtime {}
 #[async_trait::async_trait]
 pub trait Invoker: Send + Sync {
 	///
-	fn map_result<R>(r: JsonrpcResult) -> Result<R>
+	type Connection: Connection;
+
+	///
+	fn map_result<R>(r: ResponseResult) -> Result<R>
 	where
 		R: DeserializeOwned,
 	{
-		Ok(r.map_err(|e| error::Net::JsonrpcResponse(e.error))?)
-			.and_then(|r| Ok(serde_json::from_value::<R>(r.result).map_err(error::Generic::Serde)?))
+		Ok(serde_json::from_value(r.extract_err()?.result).map_err(error::Generic::Serde)?)
 	}
 
 	///
-	async fn request<'a, Req, R>(&self, raw_request: Req) -> Result<Result<R>>
+	async fn request<'a, Req, Resp>(&self, raw_request: Req) -> Result<Result<Resp>>
 	where
 		Req: IntoRequestRaw<'a>,
-		R: DeserializeOwned;
+		Resp: DeserializeOwned;
 
 	///
-	async fn batch<'a, Req, R>(&self, raw_requests: Vec<Req>) -> Result<Vec<Result<R>>>
+	async fn batch<'a, Req, Resp>(&self, raw_requests: Vec<Req>) -> Result<Vec<Result<Resp>>>
 	where
 		Req: IntoRequestRaw<'a>,
-		R: DeserializeOwned;
+		Resp: DeserializeOwned;
+
+	///
+	async fn subscribe<'a, Req, M, Resp>(
+		&self,
+		raw_request: Req,
+		unsubscribe_method: M,
+	) -> Result<Subscriber<'a, Self::Connection, Req, Resp>>
+	where
+		Req: IntoRequestRaw<'a>,
+		M: Send + AsRef<str>,
+		Resp: DeserializeOwned;
 }
 #[async_trait::async_trait]
 impl<T> Invoker for T
 where
 	T: Connection,
 {
+	type Connection = T;
+
 	async fn request<'a, Req, R>(&self, raw_request: Req) -> Result<Result<R>>
 	where
 		Req: IntoRequestRaw<'a>,
 		R: DeserializeOwned,
 	{
-		Ok(self.request(raw_request).await.map_err(error::Net::Jsonrpc)?).map(Self::map_result)
+		Ok(self.request(raw_request).await.map(Self::map_result)?)
 	}
 
-	async fn batch<'a, Req, R>(&self, raw_requests: Vec<Req>) -> Result<Vec<Result<R>>>
+	async fn batch<'a, Req, Resp>(&self, raw_requests: Vec<Req>) -> Result<Vec<Result<Resp>>>
 	where
 		Req: IntoRequestRaw<'a>,
-		R: DeserializeOwned,
+		Resp: DeserializeOwned,
 	{
-		Ok(self.batch(raw_requests).await.map_err(error::Net::Jsonrpc)?)
-			.map(|v| v.into_iter().map(Self::map_result).collect())
+		Ok(self.batch(raw_requests).await?.into_iter().map(Self::map_result).collect())
+	}
+
+	async fn subscribe<'a, Req, M, Resp>(
+		&self,
+		raw_request: Req,
+		unsubscribe_method: M,
+	) -> Result<Subscriber<'a, Self::Connection, Req, Resp>>
+	where
+		Req: IntoRequestRaw<'a>,
+		M: Send + AsRef<str>,
+		Resp: DeserializeOwned,
+	{
+		Ok(self.subscribe(raw_request, unsubscribe_method).await.unwrap())
 	}
 }
 
@@ -92,15 +119,15 @@ where
 	where
 		Iz: Initialize<Connection = I>,
 	{
-		let invoker = Arc::new(initializer.initialize().await.map_err(error::Net::Jsonrpc)?);
+		let invoker = Arc::new(initializer.initialize().await?);
 		let mut apeye = Self { invoker, metadata: Default::default(), runtime: Default::default() };
 
 		apeye.metadata =
 			submetadatan::unprefix_raw_metadata_minimal(apeye.get_metadata::<String>(None).await??)
 				.expect("[apeye] failed to parse metadata");
 
-		#[cfg(feature = "trace")]
-		tracing::trace!("Metadata({:?})", apeye.metadata);
+		// #[cfg(feature = "trace")]
+		// tracing::trace!("Metadata({:?})", apeye.metadata);
 
 		Ok(apeye)
 	}
@@ -111,12 +138,14 @@ where
 	I: Invoker,
 	R: Runtime,
 {
+	type Connection = I::Connection;
+
 	async fn request<'a, Req, Resp>(&self, raw_request: Req) -> Result<Result<Resp>>
 	where
 		Req: IntoRequestRaw<'a>,
 		Resp: DeserializeOwned,
 	{
-		I::request::<_, _>(&self.invoker, raw_request).await
+		self.invoker.request(raw_request).await
 	}
 
 	async fn batch<'a, Req, Resp>(&self, raw_requests: Vec<Req>) -> Result<Vec<Result<Resp>>>
@@ -124,7 +153,20 @@ where
 		Req: IntoRequestRaw<'a>,
 		Resp: DeserializeOwned,
 	{
-		I::batch::<_, _>(&self.invoker, raw_requests).await
+		self.invoker.batch(raw_requests).await
+	}
+
+	async fn subscribe<'a, Req, M, Resp>(
+		&self,
+		raw_request: Req,
+		unsubscribe_method: M,
+	) -> Result<Subscriber<'a, Self::Connection, Req, Resp>>
+	where
+		Req: IntoRequestRaw<'a>,
+		M: Send + AsRef<str>,
+		Resp: DeserializeOwned,
+	{
+		self.invoker.subscribe(raw_request, unsubscribe_method).await
 	}
 }
 impl<I, R> Meta for Apeye<I, R>

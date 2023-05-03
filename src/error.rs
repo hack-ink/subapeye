@@ -15,7 +15,7 @@ pub enum Error {
 	#[error(transparent)]
 	Generic(#[from] Generic),
 	#[error(transparent)]
-	Net(#[from] Net),
+	Jsonrpc(#[from] crate::jsonrpc::Error),
 }
 
 /// An error helper/wrapper to debug/print the error quickly.
@@ -57,16 +57,6 @@ pub enum Generic {
 	Serde(#[from] serde_json::Error),
 }
 /// Wrap the error with [`Generic::AlmostImpossible`].
-pub fn almost_impossible(e_msg: &'static str) -> Generic {
-	Generic::AlmostImpossible(e_msg)
-}
-
-/// JSONRPC error.
-#[allow(missing_docs)]
-#[derive(Debug, ThisError)]
-pub enum Net {
-	#[error(transparent)]
-	Jsonrpc(#[from] crate::jsonrpc::Error),
-	#[error("[jsonrpc] response error, {0:?}")]
-	JsonrpcResponse(serde_json::Value),
+pub fn almost_impossible(error: &'static str) -> Generic {
+	Generic::AlmostImpossible(error)
 }
