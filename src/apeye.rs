@@ -58,12 +58,7 @@ where
 		Req: IntoRequestRaw<&'a str>,
 		R: DeserializeOwned,
 	{
-		let r = request_raw.into();
-
-		Ok(self
-			.request(RequestRaw { method: r.method.into(), params: r.params })
-			.await
-			.map(Self::map_result)?)
+		Ok(self.request(request_raw).await.map(Self::map_result)?)
 	}
 
 	async fn batch<'a, Req, Resp>(&self, requests_raw: Vec<Req>) -> Result<Vec<Result<Resp>>>

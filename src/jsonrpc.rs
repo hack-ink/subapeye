@@ -20,22 +20,26 @@ use prelude::*;
 
 // std
 use std::{
-	borrow::Cow,
 	fmt::{Debug, Formatter, Result as FmtResult},
 	future::Future,
 	hash::Hash,
 	marker::PhantomData,
+	mem,
 	pin::Pin,
 	sync::{
 		atomic::{AtomicUsize, Ordering},
 		Arc,
 	},
+	time::Duration,
 };
 // crates.io
 use fxhash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+	sync::{mpsc, oneshot, Mutex},
+	time,
+};
 
 /// JSONRPC Id.
 pub type Id = usize;
@@ -47,8 +51,8 @@ pub type ResponseResult = StdResult<ResponseOk, JsonrpcError>;
 ///
 pub type SubscriptionResult = StdResult<NotificationOk, JsonrpcError>;
 
-type MessageTx = mpsc::Sender<Message>;
-type MessageRx = mpsc::Receiver<Message>;
+// type MessageTx = mpsc::Sender<Message>;
+// type MessageRx = mpsc::Receiver<Message>;
 
 type ErrorTx = oneshot::Sender<Error>;
 type ErrorRx = oneshot::Receiver<Error>;
@@ -58,27 +62,23 @@ type ExitRx = oneshot::Receiver<()>;
 
 type ResponseTx<T> = oneshot::Sender<Result<T>>;
 
-type SubscriptionTx = mpsc::Sender<SubscriptionResult>;
-type SubscriptionRx = mpsc::Receiver<SubscriptionResult>;
-
 type RequestTx = ResponseTx<ResponseResult>;
 type BatchTx = ResponseTx<Vec<ResponseResult>>;
 
 type Pool<K, V> = FxHashMap<K, V>;
 type RequestPool = Pool<Id, RequestTx>;
 type BatchPool = Pool<Id, BatchTx>;
-type SubscriptionPool = Pool<SubscriptionId, SubscriptionTx>;
 
 /// JSONRPC version.
 pub const VERSION: &str = "2.0";
 
-const E_EMPTY_LOCK: &str = "[jsonrpc] acquired `lock` is empty";
 const E_ERROR_CHANNEL_CLOSED: &str = "[jsonrpc] error channel closed";
 const E_INVALID_RESPONSE: &str = "[jsonrpc] unable to process response";
 const E_MESSAGE_CHANNEL_CLOSED: &str = "[jsonrpc] message channel closed";
 const E_NO_ERROR: &str = "[jsonrpc] no error to report";
 const E_RESPONSE_CHANNEL_CLOSED: &str = "[jsonrpc] response channel closed";
 const E_TX_NOT_FOUND: &str = "[jsonrpc] tx not found in the pool";
+const E_UNEXPECTED_LOCK_COUNT: &str = "[jsonrpc] unexpected lock count";
 
 ///
 #[async_trait::async_trait]
@@ -108,7 +108,7 @@ pub trait Jsonrpc: Sync + Send {
 	/// Send a single request.
 	async fn request<'a, R>(&self, request_raw: R) -> Result<ResponseResult>
 	where
-		R: IntoRequestRaw<Cow<'a, str>>;
+		R: IntoRequestRaw<&'a str>;
 
 	/// Send a batch of requests.
 	async fn batch<'a, R>(&self, requests_raw: Vec<R>) -> Result<Vec<ResponseResult>>
@@ -158,6 +158,8 @@ trait PoolExt {
 	type Key: PartialEq + Eq + Hash;
 	type Value;
 
+	fn get_tx(&self, key: &Self::Key) -> &Self::Value;
+
 	fn take_tx(&mut self, key: &Self::Key) -> Self::Value;
 }
 impl<K, V> PoolExt for Pool<K, V>
@@ -166,6 +168,10 @@ where
 {
 	type Key = K;
 	type Value = V;
+
+	fn get_tx(&self, key: &Self::Key) -> &Self::Value {
+		self.get(key).expect(E_TX_NOT_FOUND)
+	}
 
 	fn take_tx(&mut self, key: &Self::Key) -> Self::Value {
 		self.remove(key).expect(E_TX_NOT_FOUND)
@@ -307,14 +313,23 @@ struct RequestQueueGuard<L> {
 	_strong: Arc<()>,
 }
 
+#[derive(Debug, Default)]
+struct Pools {
+	requests: RequestPool,
+	batches: BatchPool,
+}
+// impl Pools {
+// 	fn new() -> Self {
+// 		Default::default()
+// 	}
+// }
+
 #[derive(Debug)]
 enum Message {
 	#[cfg(feature = "debug")]
 	Debug(Id),
-	Request(Call<ResponseResult>),
-	Batch(Call<Vec<ResponseResult>>),
-	Subscribe(Subscription),
-	Unsubscribe(SubscriptionId),
+	Request(CallOnce<ResponseResult>),
+	Batch(CallOnce<Vec<ResponseResult>>),
 }
 // A single request object.
 // `id`: Request Id.
@@ -323,91 +338,52 @@ enum Message {
 //
 // A batch requests object to send several request objects simultaneously.
 // `id`: The first request's id.
-struct Call<T> {
+struct CallOnce<T> {
 	id: Id,
 	request: String,
 	tx: ResponseTx<T>,
 }
-impl<T> Debug for Call<T>
+impl<T> Debug for CallOnce<T>
 where
 	T: Debug,
 {
 	fn fmt(&self, f: &mut Formatter) -> FmtResult {
-		write!(f, "Call {{ id: {}, request: {}, tx: {:?} }}", self.id, self.request, self.tx)
+		write!(f, "CallOnce {{ id: {}, request: {}, tx: {:?} }}", self.id, self.request, self.tx)
 	}
 }
-#[derive(Debug)]
-struct Subscription {
-	id: String,
-	tx: SubscriptionTx,
-}
 
-#[derive(Debug, Default)]
-struct Pools {
-	requests: RequestPool,
-	batches: BatchPool,
-	subscriptions: SubscriptionPool,
-}
-impl Pools {
-	fn new() -> Self {
-		Default::default()
+#[derive(Clone, Debug)]
+struct Reporter(Arc<Mutex<StdResult<ErrorRx, String>>>);
+impl Reporter {
+	fn new(error_rx: ErrorRx) -> Self {
+		Self(Arc::new(Mutex::new(Ok(error_rx))))
 	}
 
-	async fn process_response(&mut self, response: &[u8]) -> Result<()> {
-		let r = response.trim_ascii_start();
-		let first = r.first().ok_or(error::Jsonrpc::EmptyResponse)?;
+	// Don't call this if code hasn't encountered any error yet,
+	// as it will block the asynchronous process.
+	async fn report(&self) -> Result<()> {
+		let mut error_rx = self.0.lock().await;
+		let e =
+			match mem::replace(&mut *error_rx, Err("[jsonrpc] temporary error placeholder".into()))
+			{
+				Ok(r) => r
+					.await
+					.map_err(|_| error::almost_impossible(E_ERROR_CHANNEL_CLOSED))?
+					.to_string(),
+				Err(e) => e,
+			};
 
-		match first {
-			b'{' =>
-				if let Ok(o) = serde_json::from_slice::<ResponseOk>(r) {
-					self.requests.take_tx(&o.id).send(Ok(Ok(o))).expect(E_RESPONSE_CHANNEL_CLOSED);
+		*error_rx = Err(e.clone());
 
-					return Ok(());
-				} else if let Ok(e) = serde_json::from_slice::<JsonrpcError>(r) {
-					// E.g.
-					// ```
-					// {"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":2}
-					// ```
-
-					self.requests.take_tx(&e.id).send(Ok(Err(e))).expect(E_RESPONSE_CHANNEL_CLOSED);
-
-					return Ok(());
-				} else if let Ok(o) = serde_json::from_slice::<NotificationOk>(r) {
-					self.subscriptions
-						.take_tx(&o.params.subscription)
-						.send(Ok(o))
-						.await
-						.expect(E_RESPONSE_CHANNEL_CLOSED);
-
-					return Ok(());
-				},
-			b'[' =>
-				if let Ok(r) = serde_json::from_slice::<Vec<&RawValue>>(r) {
-					let r = r
-						.into_iter()
-						.map(|r| {
-							if let Ok(o) = serde_json::from_str::<ResponseOk>(r.get()) {
-								Ok(Ok(o))
-							} else if let Ok(e) = serde_json::from_str::<JsonrpcError>(r.get()) {
-								Ok(Err(e))
-							} else {
-								Err(error::almost_impossible(E_INVALID_RESPONSE))?
-							}
-						})
-						.collect::<Result<Vec<ResponseResult>>>()?;
-
-					self.batches
-						.take_tx(&r.first().ok_or(error::Jsonrpc::EmptyBatch)?.id())
-						.send(Ok(r))
-						.expect(E_RESPONSE_CHANNEL_CLOSED);
-
-					return Ok(());
-				},
-			_ => (),
-		}
-
-		Err(error::almost_impossible(E_INVALID_RESPONSE))?
+		Err(error::Generic::Plain(e))?
 	}
+}
+
+async fn execute<F>(future: F, timeout: Duration) -> Result<<F as Future>::Output>
+where
+	F: Future,
+{
+	Ok(time::timeout(timeout, future).await.map_err(error::Generic::Timeout)?)
 }
 
 fn try_send<T>(tx: oneshot::Sender<T>, any: T, log: bool) -> bool

@@ -21,7 +21,7 @@ pub struct Initializer<'a> {
 	/// Send tick with this interval to keep the WS alive.
 	pub interval: Duration,
 	/// Request timeout.
-	pub request_timeout: Duration,
+	pub timeout: Duration,
 	/// Future selector.
 	pub future_selector: FutureSelector,
 }
@@ -52,9 +52,9 @@ impl<'a> Initializer<'a> {
 		self
 	}
 
-	/// Set the [`request_timeout`](#structfield.request_timeout).
-	pub fn request_timeout(mut self, request_timeout: Duration) -> Self {
-		self.request_timeout = request_timeout;
+	/// Set the [`timeout`](#structfield.timeout).
+	pub fn timeout(mut self, timeout: Duration) -> Self {
+		self.timeout = timeout;
 
 		self
 	}
@@ -68,20 +68,18 @@ impl<'a> Initializer<'a> {
 
 	/// Initialize the connection.
 	pub async fn initialize(self) -> Result<Ws> {
-		let (messenger, reporter, closer) = self.connect().await?;
+		let (message_tx, error_rx, exit_tx) = self.connect().await?;
 
 		Ok(Ws {
-			inner: Arc::new(WsInner {
-				messenger,
-				request_queue: RequestQueue::with_size(self.pool_size),
-				request_timeout: self.request_timeout,
-				reporter: Mutex::new(Ok(reporter)),
-			}),
-			closer: Some(closer),
+			message_tx,
+			request_queue: RequestQueue::with_size(self.pool_size),
+			timeout: self.timeout,
+			reporter: Reporter::new(error_rx),
+			exit_tx: Some(exit_tx),
 		})
 	}
 
-	async fn connect(&self) -> Result<(MessageTx, ErrorRx, ExitTx)> {
+	async fn connect(&self) -> Result<(MessageExtTx, ErrorRx, ExitTx)> {
 		let connect_inner = self.future_selector.connector();
 		let interval = self.interval;
 		let (ws_tx, ws_rx) = tokio_tungstenite::connect_async(self.uri)
@@ -106,7 +104,7 @@ impl<'a> Default for Initializer<'a> {
 			uri: "ws://127.0.0.1:9944",
 			pool_size: 1_024,
 			interval: Duration::from_secs(10),
-			request_timeout: Duration::from_secs(30),
+			timeout: Duration::from_secs(30),
 			future_selector: FutureSelector::default(),
 		}
 	}

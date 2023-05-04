@@ -57,8 +57,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 	// );
 	// dbg!(apeye.version::<Value>().await?.unwrap_err());
 
-	apeye
-		.subscribe::<_, ()>(
+	let mut subscriber = apeye
+		.subscribe::<_, Value>(
 			(
 				"state_subscribeStorage",
 				serde_json::json!([[
@@ -69,6 +69,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 		)
 		.await
 		.unwrap();
+
+	while let Some(notification) = subscriber.next().await? {
+		dbg!(notification);
+	}
 
 	Ok(())
 }
