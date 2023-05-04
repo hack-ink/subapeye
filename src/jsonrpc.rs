@@ -1,0 +1,402 @@
+//! JSONRPC client library.
+
+pub mod ws;
+pub use ws::{Subscriber, Ws, WsInitializer};
+
+pub mod error;
+pub use error::Error;
+
+pub mod prelude {
+	//! JSONRPC prelude.
+
+	pub use std::result::Result as StdResult;
+
+	pub use crate::jsonrpc::error::{self, Error};
+
+	/// Subapeye's `Result` type.
+	pub type Result<T> = StdResult<T, Error>;
+}
+use prelude::*;
+
+// std
+use std::{
+	fmt::{Debug, Formatter, Result as FmtResult},
+	future::Future,
+	hash::Hash,
+	marker::PhantomData,
+	mem,
+	pin::Pin,
+	sync::{
+		atomic::{AtomicUsize, Ordering},
+		Arc,
+	},
+	time::Duration,
+};
+// crates.io
+use fxhash::FxHashMap;
+use serde::{Deserialize, Serialize};
+use serde_json::{value::RawValue, Value};
+use tokio::{
+	sync::{mpsc, oneshot, Mutex},
+	time,
+};
+
+/// JSONRPC Id.
+pub type Id = usize;
+/// Subscription Id.
+pub type SubscriptionId = String;
+
+///
+pub type ResponseResult = StdResult<ResponseOk, JsonrpcError>;
+///
+pub type SubscriptionResult = StdResult<NotificationOk, JsonrpcError>;
+
+// type MessageTx = mpsc::Sender<Message>;
+// type MessageRx = mpsc::Receiver<Message>;
+
+type ErrorTx = oneshot::Sender<Error>;
+type ErrorRx = oneshot::Receiver<Error>;
+
+type ExitTx = oneshot::Sender<()>;
+type ExitRx = oneshot::Receiver<()>;
+
+type ResponseTx<T> = oneshot::Sender<Result<T>>;
+
+type RequestTx = ResponseTx<ResponseResult>;
+type BatchTx = ResponseTx<Vec<ResponseResult>>;
+
+type Pool<K, V> = FxHashMap<K, V>;
+type RequestPool = Pool<Id, RequestTx>;
+type BatchPool = Pool<Id, BatchTx>;
+
+/// JSONRPC version.
+pub const VERSION: &str = "2.0";
+
+const E_ERROR_CHANNEL_CLOSED: &str = "[jsonrpc] error channel closed";
+const E_INVALID_RESPONSE: &str = "[jsonrpc] unable to process response";
+const E_MESSAGE_CHANNEL_CLOSED: &str = "[jsonrpc] message channel closed";
+const E_NO_ERROR: &str = "[jsonrpc] no error to report";
+const E_RESPONSE_CHANNEL_CLOSED: &str = "[jsonrpc] response channel closed";
+const E_TX_NOT_FOUND: &str = "[jsonrpc] tx not found in the pool";
+const E_UNEXPECTED_LOCK_COUNT: &str = "[jsonrpc] unexpected lock count";
+
+///
+#[async_trait::async_trait]
+pub trait Initialize {
+	///
+	type Protocol;
+
+	///
+	async fn initialize(self) -> Result<Self::Protocol>;
+}
+#[async_trait::async_trait]
+impl<'a> Initialize for WsInitializer<'a> {
+	type Protocol = Ws;
+
+	async fn initialize(self) -> Result<Self::Protocol> {
+		self.initialize().await
+	}
+}
+
+///
+pub trait IntoRequestRaw<T>: Send + Into<RequestRaw<T>> {}
+impl<M, T> IntoRequestRaw<M> for T where T: Send + Into<RequestRaw<M>> {}
+
+///
+#[async_trait::async_trait]
+pub trait Jsonrpc: Sync + Send {
+	/// Send a single request.
+	async fn request<'a, R>(&self, request_raw: R) -> Result<ResponseResult>
+	where
+		R: IntoRequestRaw<&'a str>;
+
+	/// Send a batch of requests.
+	async fn batch<'a, R>(&self, requests_raw: Vec<R>) -> Result<Vec<ResponseResult>>
+	where
+		R: IntoRequestRaw<&'a str>;
+}
+///
+#[async_trait::async_trait]
+pub trait JsonrpcExt: Jsonrpc {
+	/// Send a subscription.
+	async fn subscribe<'a, R, D>(
+		&self,
+		request_raw: R,
+		unsubscribe_method: String,
+	) -> Result<Subscriber<D>>
+	where
+		R: IntoRequestRaw<&'a str>;
+}
+
+///
+pub trait ResultExt {
+	///
+	type Ok;
+
+	///
+	fn id(&self) -> Id;
+
+	///
+	fn extract_err(self) -> Result<Self::Ok>;
+}
+impl ResultExt for ResponseResult {
+	type Ok = ResponseOk;
+
+	fn id(&self) -> Id {
+		match self {
+			Self::Ok(o) => o.id,
+			Self::Err(e) => e.id,
+		}
+	}
+
+	fn extract_err(self) -> Result<<Self as ResultExt>::Ok> {
+		Ok(self.map_err(|e| error::Jsonrpc::Response(e.error))?)
+	}
+}
+
+trait PoolExt {
+	type Key: PartialEq + Eq + Hash;
+	type Value;
+
+	fn get_tx(&self, key: &Self::Key) -> &Self::Value;
+
+	fn take_tx(&mut self, key: &Self::Key) -> Self::Value;
+}
+impl<K, V> PoolExt for Pool<K, V>
+where
+	K: PartialEq + Eq + Hash,
+{
+	type Key = K;
+	type Value = V;
+
+	fn get_tx(&self, key: &Self::Key) -> &Self::Value {
+		self.get(key).expect(E_TX_NOT_FOUND)
+	}
+
+	fn take_tx(&mut self, key: &Self::Key) -> Self::Value {
+		self.remove(key).expect(E_TX_NOT_FOUND)
+	}
+}
+
+/// Generic JSONRPC request.
+#[allow(missing_docs)]
+#[derive(Clone, Debug, Serialize)]
+pub struct Request<'a, P> {
+	#[serde(borrow)]
+	pub jsonrpc: &'a str,
+	pub id: Id,
+	#[serde(borrow)]
+	pub method: &'a str,
+	pub params: P,
+}
+/// Raw JSONRPC request.
+#[allow(missing_docs)]
+#[derive(Clone, Debug)]
+pub struct RequestRaw<T> {
+	pub method: T,
+	pub params: Value,
+}
+impl<T> From<(T, Value)> for RequestRaw<T> {
+	fn from(v: (T, Value)) -> Self {
+		Self { method: v.0, params: v.1 }
+	}
+}
+
+/// Generic JSONRPC response result.
+#[allow(missing_docs)]
+#[derive(Clone, Deserialize)]
+pub struct ResponseOk {
+	pub jsonrpc: String,
+	pub id: Id,
+	pub result: Value,
+}
+impl Debug for ResponseOk {
+	fn fmt(&self, f: &mut Formatter) -> FmtResult {
+		write!(
+			f,
+			"ResponseOk {{ jsonrpc: {}, id: {}, result: {} }}",
+			self.jsonrpc, self.id, self.result
+		)
+	}
+}
+
+/// Generic JSONRPC error.
+#[allow(missing_docs)]
+#[derive(Clone, Deserialize)]
+pub struct JsonrpcError {
+	pub jsonrpc: String,
+	pub id: Id,
+	pub error: Value,
+}
+impl Debug for JsonrpcError {
+	fn fmt(&self, f: &mut Formatter) -> FmtResult {
+		write!(
+			f,
+			"JsonrpcError {{ jsonrpc: {}, id: {}, error: {} }}",
+			self.jsonrpc, self.id, self.error
+		)
+	}
+}
+
+/// Generic JSONRPC notification.
+#[allow(missing_docs)]
+#[derive(Clone, Debug, Deserialize)]
+pub struct NotificationOk {
+	pub jsonrpc: String,
+	pub method: String,
+	pub params: NotificationParams,
+}
+/// Generic JSONRPC notification params.
+#[allow(missing_docs)]
+#[derive(Clone, Deserialize)]
+pub struct NotificationParams {
+	subscription: SubscriptionId,
+	result: Value,
+}
+impl Debug for NotificationParams {
+	fn fmt(&self, f: &mut Formatter) -> FmtResult {
+		write!(
+			f,
+			"NotificationParams {{ subscription: {}, result: {} }}",
+			self.subscription, self.result
+		)
+	}
+}
+
+#[derive(Debug)]
+struct RequestQueue {
+	size: Id,
+	active: Arc<()>,
+	next: AtomicUsize,
+}
+impl RequestQueue {
+	fn with_size(size: Id) -> Self {
+		Self { size, active: Default::default(), next: Default::default() }
+	}
+
+	fn consume_once(&self) -> Result<RequestQueueGuard<Id>> {
+		let active = Arc::strong_count(&self.active);
+
+		#[cfg(feature = "trace")]
+		tracing::trace!("RequestQueue({active}/{})", self.size);
+
+		if active == self.size {
+			Err(error::Jsonrpc::ExceededRequestQueueMaxSize(self.size))?
+		} else {
+			Ok(RequestQueueGuard {
+				lock: self.next.fetch_add(1, Ordering::SeqCst),
+				_strong: self.active.clone(),
+			})
+		}
+	}
+
+	fn consume(&self, count: Id) -> Result<RequestQueueGuard<Vec<Id>>> {
+		let active = Arc::strong_count(&self.active);
+
+		#[cfg(feature = "trace")]
+		tracing::trace!("RequestQueue({active}/{})", self.size);
+
+		if active == self.size {
+			Err(error::Jsonrpc::ExceededRequestQueueMaxSize(self.size))?
+		} else {
+			Ok(RequestQueueGuard {
+				lock: (0..count).map(|_| self.next.fetch_add(1, Ordering::SeqCst)).collect(),
+				_strong: self.active.clone(),
+			})
+		}
+	}
+}
+
+#[derive(Debug)]
+struct RequestQueueGuard<L> {
+	lock: L,
+	_strong: Arc<()>,
+}
+
+#[derive(Debug, Default)]
+struct Pools {
+	requests: RequestPool,
+	batches: BatchPool,
+}
+// impl Pools {
+// 	fn new() -> Self {
+// 		Default::default()
+// 	}
+// }
+
+#[derive(Debug)]
+enum Message {
+	#[cfg(feature = "debug")]
+	Debug(Id),
+	Request(CallOnce<ResponseResult>),
+	Batch(CallOnce<Vec<ResponseResult>>),
+}
+// A single request object.
+// `id`: Request Id.
+//
+// Or
+//
+// A batch requests object to send several request objects simultaneously.
+// `id`: The first request's id.
+struct CallOnce<T> {
+	id: Id,
+	request: String,
+	tx: ResponseTx<T>,
+}
+impl<T> Debug for CallOnce<T>
+where
+	T: Debug,
+{
+	fn fmt(&self, f: &mut Formatter) -> FmtResult {
+		write!(f, "CallOnce {{ id: {}, request: {}, tx: {:?} }}", self.id, self.request, self.tx)
+	}
+}
+
+#[derive(Clone, Debug)]
+struct Reporter(Arc<Mutex<StdResult<ErrorRx, String>>>);
+impl Reporter {
+	fn new(error_rx: ErrorRx) -> Self {
+		Self(Arc::new(Mutex::new(Ok(error_rx))))
+	}
+
+	// Don't call this if code hasn't encountered any error yet,
+	// as it will block the asynchronous process.
+	async fn report(&self) -> Result<()> {
+		let mut error_rx = self.0.lock().await;
+		let e =
+			match mem::replace(&mut *error_rx, Err("[jsonrpc] temporary error placeholder".into()))
+			{
+				Ok(r) => r
+					.await
+					.map_err(|_| error::almost_impossible(E_ERROR_CHANNEL_CLOSED))?
+					.to_string(),
+				Err(e) => e,
+			};
+
+		*error_rx = Err(e.clone());
+
+		Err(error::Generic::Plain(e))?
+	}
+}
+
+async fn execute<F>(future: F, timeout: Duration) -> Result<<F as Future>::Output>
+where
+	F: Future,
+{
+	Ok(time::timeout(timeout, future).await.map_err(error::Generic::Timeout)?)
+}
+
+fn try_send<T>(tx: oneshot::Sender<T>, any: T, log: bool) -> bool
+where
+	T: Debug,
+{
+	if let Err(e) = tx.send(any) {
+		if log {
+			tracing::error!("[jsonrpc] failed to throw this error to outside, {e:?}");
+		}
+
+		return false;
+	}
+
+	true
+}
