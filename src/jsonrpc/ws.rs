@@ -434,7 +434,7 @@ impl<D> Subscriber<D> {
 			.await
 			.is_err()
 		{
-			self.reporter.report().await;
+			self.reporter.report().await?;
 		}
 		if let Ok(r) = execute(rx, self.timeout).await? {
 			r
