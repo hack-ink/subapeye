@@ -13,8 +13,8 @@ use serde::de::DeserializeOwned;
 use submetadatan::{Meta, Metadata, StorageEntry};
 // subapeye
 use crate::{
-	jsonrpc::{Connection, Initialize, IntoRequestRaw, ResponseResult, ResultExt, Subscriber},
-	prelude::*,
+	jsonrpc::*,
+	prelude::{error, Result},
 };
 
 ///
@@ -22,11 +22,12 @@ pub trait Layer: Invoker + Runtime {}
 impl<T> Layer for T where T: Invoker + Runtime {}
 
 ///
+pub trait LayerExt: Layer + InvokerExt {}
+impl<T> LayerExt for T where T: Layer + InvokerExt {}
+
+///
 #[async_trait::async_trait]
 pub trait Invoker: Send + Sync {
-	///
-	type Connection: Connection;
-
 	///
 	fn map_result<R>(r: ResponseResult) -> Result<R>
 	where
@@ -36,72 +37,77 @@ pub trait Invoker: Send + Sync {
 	}
 
 	///
-	async fn request<'a, Req, Resp>(&self, raw_request: Req) -> Result<Result<Resp>>
+	async fn request<'a, Req, Resp>(&self, request_raw: Req) -> Result<Result<Resp>>
 	where
-		Req: IntoRequestRaw<'a>,
+		Req: IntoRequestRaw<&'a str>,
 		Resp: DeserializeOwned;
 
 	///
-	async fn batch<'a, Req, Resp>(&self, raw_requests: Vec<Req>) -> Result<Vec<Result<Resp>>>
+	async fn batch<'a, Req, Resp>(&self, requests_raw: Vec<Req>) -> Result<Vec<Result<Resp>>>
 	where
-		Req: IntoRequestRaw<'a>,
-		Resp: DeserializeOwned;
-
-	///
-	async fn subscribe<'a, Req, M, Resp>(
-		&self,
-		raw_request: Req,
-		unsubscribe_method: M,
-	) -> Result<Subscriber<'a, Self::Connection, Req, Resp>>
-	where
-		Req: IntoRequestRaw<'a>,
-		M: Send + AsRef<str>,
+		Req: IntoRequestRaw<&'a str>,
 		Resp: DeserializeOwned;
 }
 #[async_trait::async_trait]
 impl<T> Invoker for T
 where
-	T: Connection,
+	T: Jsonrpc,
 {
-	type Connection = T;
-
-	async fn request<'a, Req, R>(&self, raw_request: Req) -> Result<Result<R>>
+	async fn request<'a, Req, R>(&self, request_raw: Req) -> Result<Result<R>>
 	where
-		Req: IntoRequestRaw<'a>,
+		Req: IntoRequestRaw<&'a str>,
 		R: DeserializeOwned,
 	{
-		Ok(self.request(raw_request).await.map(Self::map_result)?)
+		let r = request_raw.into();
+
+		Ok(self
+			.request(RequestRaw { method: r.method.into(), params: r.params })
+			.await
+			.map(Self::map_result)?)
 	}
 
-	async fn batch<'a, Req, Resp>(&self, raw_requests: Vec<Req>) -> Result<Vec<Result<Resp>>>
+	async fn batch<'a, Req, Resp>(&self, requests_raw: Vec<Req>) -> Result<Vec<Result<Resp>>>
 	where
-		Req: IntoRequestRaw<'a>,
+		Req: IntoRequestRaw<&'a str>,
 		Resp: DeserializeOwned,
 	{
-		Ok(self.batch(raw_requests).await?.into_iter().map(Self::map_result).collect())
+		Ok(self.batch(requests_raw).await?.into_iter().map(Self::map_result).collect())
 	}
-
-	async fn subscribe<'a, Req, M, Resp>(
+}
+///
+#[async_trait::async_trait]
+pub trait InvokerExt: Invoker {
+	///
+	async fn subscribe<'a, Req, Resp>(
 		&self,
-		raw_request: Req,
-		unsubscribe_method: M,
-	) -> Result<Subscriber<'a, Self::Connection, Req, Resp>>
+		request_raw: Req,
+		unsubscribe_method: String,
+	) -> Result<Subscriber<Resp>>
 	where
-		Req: IntoRequestRaw<'a>,
-		M: Send + AsRef<str>,
+		Req: IntoRequestRaw<&'a str>,
+		Resp: DeserializeOwned;
+}
+#[async_trait::async_trait]
+impl<T> InvokerExt for T
+where
+	T: Invoker + JsonrpcExt,
+{
+	async fn subscribe<'a, Req, Resp>(
+		&self,
+		request_raw: Req,
+		unsubscribe_method: String,
+	) -> Result<Subscriber<Resp>>
+	where
+		Req: IntoRequestRaw<&'a str>,
 		Resp: DeserializeOwned,
 	{
-		Ok(self.subscribe(raw_request, unsubscribe_method).await.unwrap())
+		Ok(self.subscribe(request_raw, unsubscribe_method).await.unwrap())
 	}
 }
 
 /// The API client for Substrate-like chain.
 #[derive(Clone, Debug)]
-pub struct Apeye<I, R>
-where
-	I: Invoker,
-	R: Runtime,
-{
+pub struct Apeye<I, R> {
 	///
 	pub invoker: Arc<I>,
 	///
@@ -109,15 +115,15 @@ where
 	///
 	pub runtime: PhantomData<R>,
 }
-impl<I, R> Apeye<I, R>
+impl<Ivk, R> Apeye<Ivk, R>
 where
-	I: Invoker,
+	Ivk: Invoker,
 	R: Runtime,
 {
 	/// Initialize the API client with the given initializer.
 	pub async fn initialize<Iz>(initializer: Iz) -> Result<Self>
 	where
-		Iz: Initialize<Connection = I>,
+		Iz: Initialize<Protocol = Ivk>,
 	{
 		let invoker = Arc::new(initializer.initialize().await?);
 		let mut apeye = Self { invoker, metadata: Default::default(), runtime: Default::default() };
@@ -126,48 +132,57 @@ where
 			submetadatan::unprefix_raw_metadata_minimal(apeye.get_metadata::<String>(None).await??)
 				.expect("[apeye] failed to parse metadata");
 
-		// #[cfg(feature = "trace")]
-		// tracing::trace!("Metadata({:?})", apeye.metadata);
-
 		Ok(apeye)
 	}
 }
 #[async_trait::async_trait]
-impl<I, R> Invoker for Apeye<I, R>
+impl<I, Rt> Invoker for Apeye<I, Rt>
 where
 	I: Invoker,
+	Rt: Runtime,
+{
+	async fn request<'a, Req, Resp>(&self, request_raw: Req) -> Result<Result<Resp>>
+	where
+		Req: IntoRequestRaw<&'a str>,
+		Resp: DeserializeOwned,
+	{
+		self.invoker.request(request_raw).await
+	}
+
+	async fn batch<'a, Req, Resp>(&self, requests_raw: Vec<Req>) -> Result<Vec<Result<Resp>>>
+	where
+		Req: IntoRequestRaw<&'a str>,
+		Resp: DeserializeOwned,
+	{
+		self.invoker.batch(requests_raw).await
+	}
+}
+#[async_trait::async_trait]
+impl<I, Rt> InvokerExt for Apeye<I, Rt>
+where
+	I: InvokerExt,
+	Rt: Runtime,
+{
+	async fn subscribe<'a, Req, Resp>(
+		&self,
+		request_raw: Req,
+		unsubscribe_method: String,
+	) -> Result<Subscriber<Resp>>
+	where
+		Req: IntoRequestRaw<&'a str>,
+		Resp: DeserializeOwned,
+	{
+		self.invoker.subscribe(request_raw, unsubscribe_method).await
+	}
+}
+impl<I, R> Runtime for Apeye<I, R>
+where
+	I: Send + Sync,
 	R: Runtime,
 {
-	type Connection = I::Connection;
-
-	async fn request<'a, Req, Resp>(&self, raw_request: Req) -> Result<Result<Resp>>
-	where
-		Req: IntoRequestRaw<'a>,
-		Resp: DeserializeOwned,
-	{
-		self.invoker.request(raw_request).await
-	}
-
-	async fn batch<'a, Req, Resp>(&self, raw_requests: Vec<Req>) -> Result<Vec<Result<Resp>>>
-	where
-		Req: IntoRequestRaw<'a>,
-		Resp: DeserializeOwned,
-	{
-		self.invoker.batch(raw_requests).await
-	}
-
-	async fn subscribe<'a, Req, M, Resp>(
-		&self,
-		raw_request: Req,
-		unsubscribe_method: M,
-	) -> Result<Subscriber<'a, Self::Connection, Req, Resp>>
-	where
-		Req: IntoRequestRaw<'a>,
-		M: Send + AsRef<str>,
-		Resp: DeserializeOwned,
-	{
-		self.invoker.subscribe(raw_request, unsubscribe_method).await
-	}
+	type AccountId = R::AccountId;
+	type BlockNumber = R::BlockNumber;
+	type Hash = R::Hash;
 }
 impl<I, R> Meta for Apeye<I, R>
 where

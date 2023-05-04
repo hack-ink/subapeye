@@ -5,13 +5,18 @@ pub mod initializer;
 pub use initializer::*;
 
 // std
-use std::{mem, time::Duration};
+use std::{
+	mem,
+	task::{Context, Poll},
+	time::Duration,
+};
 // crates.io
 use futures::{
 	future::{self, Either, Fuse},
 	stream::{self, SplitSink, SplitStream},
-	FutureExt, SinkExt, StreamExt,
+	FutureExt, SinkExt, Stream, StreamExt,
 };
+use serde::de::DeserializeOwned;
 use tokio::{net::TcpStream, sync::Mutex, time};
 use tokio_stream::wrappers::IntervalStream;
 use tokio_tungstenite::{
@@ -41,13 +46,84 @@ type WsReceiver = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 /// Use this to interact with the server.
 #[derive(Debug)]
 pub struct Ws {
+	inner: Arc<WsInner>,
+	closer: Option<ExitTx>,
+}
+impl Drop for Ws {
+	fn drop(&mut self) {
+		if let Some(c) = self.closer.take() {
+			let _ = c.send(());
+		} else {
+			//
+		}
+	}
+}
+#[async_trait::async_trait]
+impl Jsonrpc for Ws {
+	async fn request<'a, R>(&self, request_raw: R) -> Result<ResponseResult>
+	where
+		R: IntoRequestRaw<Cow<'a, str>>,
+	{
+		self.inner.request(request_raw).await
+	}
+
+	async fn batch<'a, R>(&self, requests_raw: Vec<R>) -> Result<Vec<ResponseResult>>
+	where
+		R: IntoRequestRaw<&'a str>,
+	{
+		self.inner.batch(requests_raw).await
+	}
+}
+#[async_trait::async_trait]
+impl JsonrpcExt for Ws {
+	async fn subscribe<'a, R, D>(
+		&self,
+		request_raw: R,
+		unsubscribe_method: String,
+	) -> Result<Subscriber<D>>
+	where
+		R: IntoRequestRaw<&'a str>,
+	{
+		let r = request_raw.into();
+		let id = self
+			.inner
+			.request(RequestRaw { method: r.method.into(), params: r.params })
+			.await?
+			.extract_err()?
+			.result
+			.as_str()
+			.ok_or(error::Jsonrpc::InvalidSubscriptionId)?
+			.to_owned();
+		// TODO?: Configurable channel size.
+		let (tx, rx) = mpsc::channel(self.inner.request_queue.size);
+
+		if self
+			.inner
+			.messenger
+			.send(Message::Subscribe(Subscription { id: id.clone(), tx }))
+			.await
+			.is_err()
+		{
+			self.inner.report().await?;
+		}
+
+		Ok(Subscriber {
+			subscription_id: id,
+			subscription_rx: rx,
+			unsubscriber: self.inner.clone(),
+			unsubscribe_method,
+			_deserialize: Default::default(),
+		})
+	}
+}
+#[derive(Debug)]
+struct WsInner {
 	messenger: MessageTx,
 	request_queue: RequestQueue,
 	request_timeout: Duration,
 	reporter: Mutex<StdResult<ErrorRx, String>>,
-	closer: Option<ExitTx>,
 }
-impl Ws {
+impl WsInner {
 	// Don't call this if code hasn't encountered any error yet,
 	// as it will block the asynchronous process.
 	async fn report(&self) -> Result<()> {
@@ -58,7 +134,7 @@ impl Ws {
 		) {
 			Ok(r) => r
 				.await
-				.map_err(|_| error::almost_impossible(E_REPORTER_CHANNEL_CLOSED))?
+				.map_err(|_| error::almost_impossible(E_ERROR_CHANNEL_CLOSED))?
 				.to_string(),
 			Err(e) => e,
 		};
@@ -75,24 +151,14 @@ impl Ws {
 		Ok(time::timeout(self.request_timeout, future).await.map_err(error::Generic::Timeout)?)
 	}
 }
-impl Drop for Ws {
-	fn drop(&mut self) {
-		if let Some(c) = self.closer.take() {
-			let _ = c.send(());
-		} else {
-			//
-		}
-	}
-}
 #[async_trait::async_trait]
-impl Jsonrpc for Ws {
-	/// Send a single request.
-	async fn request<'a, R>(&self, raw_request: R) -> Result<ResponseResult>
+impl Jsonrpc for WsInner {
+	async fn request<'a, R>(&self, request_raw: R) -> Result<ResponseResult>
 	where
-		R: IntoRequestRaw<'a>,
+		R: IntoRequestRaw<Cow<'a, str>>,
 	{
 		let RequestQueueGuard { lock: id, .. } = self.request_queue.consume_once()?;
-		let RequestRaw { method, params } = raw_request.into();
+		let RequestRaw { method, params } = request_raw.into();
 		let (tx, rx) = oneshot::channel();
 
 		#[cfg(feature = "debug")]
@@ -103,8 +169,13 @@ impl Jsonrpc for Ws {
 			.messenger
 			.send(Message::Request(Call {
 				id,
-				request: serde_json::to_string(&Request { jsonrpc: VERSION, id, method, params })
-					.map_err(error::Generic::Serde)?,
+				request: serde_json::to_string(&Request {
+					jsonrpc: VERSION,
+					id,
+					method: &method,
+					params,
+				})
+				.map_err(error::Generic::Serde)?,
 				tx,
 			}))
 			.await
@@ -119,22 +190,21 @@ impl Jsonrpc for Ws {
 		}
 	}
 
-	/// Send a batch of requests.
-	async fn batch<'a, R>(&self, raw_requests: Vec<R>) -> Result<Vec<ResponseResult>>
+	async fn batch<'a, R>(&self, requests_raw: Vec<R>) -> Result<Vec<ResponseResult>>
 	where
-		R: IntoRequestRaw<'a>,
+		R: IntoRequestRaw<&'a str>,
 	{
-		if raw_requests.is_empty() {
+		if requests_raw.is_empty() {
 			Err(error::Jsonrpc::EmptyBatch)?;
 		}
 
-		let RequestQueueGuard { lock: ids, .. } = self.request_queue.consume(raw_requests.len())?;
+		let RequestQueueGuard { lock: ids, .. } = self.request_queue.consume(requests_raw.len())?;
 		let id = ids.first().ok_or(error::almost_impossible(E_EMPTY_LOCK))?.to_owned();
 		let requests = ids
 			.into_iter()
-			.zip(raw_requests.into_iter())
-			.map(|(id, raw_request)| {
-				let RequestRaw { method, params } = raw_request.into();
+			.zip(requests_raw.into_iter())
+			.map(|(id, request_raw)| {
+				let RequestRaw { method, params } = request_raw.into();
 
 				Request { jsonrpc: VERSION, id, method, params }
 			})
@@ -153,34 +223,6 @@ impl Jsonrpc for Ws {
 		} else {
 			self.report().await.and(Err(error::almost_impossible(E_NO_ERROR))?)?
 		}
-	}
-
-	async fn subscribe<'a, R, M, D>(
-		&self,
-		raw_request: R,
-		unsubscribe_method: M,
-	) -> Result<Subscriber<'a, Self, R, D>>
-	where
-		R: IntoRequestRaw<'a>,
-		M: Send + AsRef<str>,
-	{
-		let id = self
-			.request(raw_request)
-			.await?
-			.extract_err()?
-			.result
-			.as_str()
-			.ok_or(error::Jsonrpc::InvalidSubscriptionId)?
-			.to_owned();
-		// TODO?: Configurable channel size.
-		let (tx, rx) = mpsc::channel(self.request_queue.size);
-
-		if self.messenger.send(Message::Subscription(Subscription { id, tx })).await.is_err() {
-			self.report().await?;
-		}
-
-		todo!()
-		// Ok(Subscriber { message_tx: tx, subscription_rx: rx })
 	}
 }
 
@@ -354,6 +396,68 @@ impl Default for FutureSelector {
 	}
 }
 
+///
+#[derive(Debug)]
+pub struct Subscriber<D> {
+	subscription_id: SubscriptionId,
+	subscription_rx: SubscriptionRx,
+	unsubscriber: Arc<WsInner>,
+	unsubscribe_method: String,
+	_deserialize: PhantomData<D>,
+}
+impl<D> Subscriber<D> {
+	///
+	pub async fn unsubscribe(&self) -> Result<()> {
+		self.unsubscriber
+			.messenger
+			.send(Message::Unsubscribe(self.subscription_id.clone()))
+			.await
+			.map_err(|_| error::almost_impossible(E_MESSAGE_CHANNEL_CLOSED))?;
+
+		let _ = self
+			.unsubscriber
+			.request((
+				self.unsubscribe_method.clone().into(),
+				Value::Array(vec![Value::Array(vec![Value::String(self.subscription_id.clone())])]),
+			))
+			.await?;
+
+		Ok(())
+	}
+}
+impl<D> Subscriber<D>
+where
+	D: Unpin,
+{
+	///
+	pub async fn next_raw(&mut self) -> Option<SubscriptionResult> {
+		StreamExt::next(self).await
+	}
+}
+impl<D> Subscriber<D>
+where
+	D: DeserializeOwned + Unpin,
+{
+	///
+	pub async fn next(&mut self) -> Option<Result<D>> {
+		self.next_raw().await.map(|r| {
+			r.map_err(|e| error::Error::Jsonrpc(error::Jsonrpc::Response(e.error))).and_then(|o| {
+				Ok(serde_json::from_value(o.params.result).map_err(error::Generic::Serde)?)
+			})
+		})
+	}
+}
+impl<D> Stream for Subscriber<D>
+where
+	D: Unpin,
+{
+	type Item = SubscriptionResult;
+
+	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+		self.subscription_rx.poll_recv(cx)
+	}
+}
+
 impl<T> Call<T>
 where
 	T: Debug,
@@ -385,8 +489,11 @@ impl Pools {
 				if !c.try_send_ws(tx, &mut self.batches).await {
 					return false;
 				},
-			Message::Subscription(s) => {
+			Message::Subscribe(s) => {
 				self.subscriptions.insert(s.id, s.tx);
+			},
+			Message::Unsubscribe(s) => {
+				let _ = self.subscriptions.remove(&s);
 			},
 		}
 
@@ -394,13 +501,20 @@ impl Pools {
 	}
 
 	async fn on_response_ws(&mut self, response: WsResult<WsMessage>) -> Result<()> {
-		#[cfg(feature = "trace")]
-		tracing::trace!("Response({response:?})");
-
 		match response {
 			Ok(m) => match m {
-				WsMessage::Binary(r) => self.process_response(&r).await,
-				WsMessage::Text(r) => self.process_response(r.as_bytes()).await,
+				WsMessage::Binary(r) => {
+					#[cfg(feature = "trace")]
+					tracing::trace!("Response({})", String::from_utf8_lossy(&r));
+
+					self.process_response(&r).await
+				},
+				WsMessage::Text(r) => {
+					#[cfg(feature = "trace")]
+					tracing::trace!("Response({r})");
+
+					self.process_response(r.as_bytes()).await
+				},
 				WsMessage::Ping(_) => {
 					tracing::trace!("ping");
 

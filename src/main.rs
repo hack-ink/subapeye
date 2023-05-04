@@ -3,7 +3,7 @@ use std::error::Error;
 use array_bytes::TryFromHex;
 use serde_json::Value;
 use subapeye::{
-	apeye::{api::*, runtime::Runtime, Apeye, Invoker},
+	apeye::{api::*, runtime::Runtime, Apeye, Invoker, InvokerExt},
 	jsonrpc::WsInitializer,
 };
 use subrpcer::{chain, net};
@@ -23,13 +23,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 		<Apeye<_, R>>::initialize(WsInitializer::default().uri("wss://kusama-rpc.polkadot.io"))
 			.await?;
 
-	// for h in apeye.get_block_hash::<_, Vec<String>>(Some([0, 1, 2])).await? {
-	// 	dbg!(apeye.get_block::<Value>(Some(&h)).await?);
-	// 	dbg!(apeye.get_header::<Value>(Some(&h)).await?);
+	// for h in apeye.get_block_hash::<_, Vec<String>>(Some([0, 1, 2])).await?? {
+	// 	dbg!(apeye.get_block::<Value>(Some(&h)).await??);
+	// 	dbg!(apeye.get_header::<Value>(Some(&h)).await??);
 	// }
 
-	// dbg!(apeye.get_finalized_head::<String>().await?);
-	// dbg!(apeye.query::<String>(&apeye.query_of::<()>("System", "Number")?.construct()?).await?);
+	// dbg!(apeye.get_finalized_head::<String>().await??);
+	// dbg!(apeye.query::<String>(&apeye.query_of::<()>("System", "Number")?.construct()?).await??);
 	// dbg!(
 	// 	apeye
 	// 		.query::<Value>(
@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 	// 				)))
 	// 				.construct()?
 	// 		)
-	// 		.await?
+	// 		.await??
 	// );
 	// dbg!(
 	// 	apeye
@@ -55,17 +55,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 	// 		])
 	// 		.await?
 	// );
-	dbg!(apeye.version::<Value>().await?);
+	// dbg!(apeye.version::<Value>().await?.unwrap_err());
 
 	apeye
-		.subscribe::<_, _, ()>(
+		.subscribe::<_, ()>(
 			(
 				"state_subscribeStorage",
 				serde_json::json!([[
 					"0x26aa394eea5630e07c48ae0c9558cef70a98fdbe9ce6c55837576c60c7af3850"
 				]]),
 			),
-			"state_unsubscribeStorage",
+			"state_unsubscribeStorage".into(),
 		)
 		.await
 		.unwrap();

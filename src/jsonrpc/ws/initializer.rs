@@ -71,10 +71,12 @@ impl<'a> Initializer<'a> {
 		let (messenger, reporter, closer) = self.connect().await?;
 
 		Ok(Ws {
-			messenger,
-			request_queue: RequestQueue::with_size(self.pool_size),
-			request_timeout: self.request_timeout,
-			reporter: Mutex::new(Ok(reporter)),
+			inner: Arc::new(WsInner {
+				messenger,
+				request_queue: RequestQueue::with_size(self.pool_size),
+				request_timeout: self.request_timeout,
+				reporter: Mutex::new(Ok(reporter)),
+			}),
 			closer: Some(closer),
 		})
 	}

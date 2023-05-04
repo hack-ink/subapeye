@@ -121,10 +121,7 @@ pub struct StorageQuery<'a> {
 	pub at: Option<&'a str>,
 }
 ///
-pub struct StorageQueryArgs<'a, E>
-where
-	E: EncodableArgs,
-{
+pub struct StorageQueryArgs<'a, E> {
 	///
 	pub storage_entry: StorageEntry<'a>,
 	///
@@ -186,10 +183,7 @@ where
 }
 
 ///
-pub enum Keys<'a, E>
-where
-	E: EncodableArgs,
-{
+pub enum Keys<'a, E> {
 	///
 	Raw(&'a E),
 	///

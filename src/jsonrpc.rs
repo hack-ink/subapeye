@@ -1,7 +1,7 @@
 //! JSONRPC client library.
 
 pub mod ws;
-pub use ws::{Ws, WsInitializer};
+pub use ws::{Subscriber, Ws, WsInitializer};
 
 pub mod error;
 pub use error::Error;
@@ -20,6 +20,7 @@ use prelude::*;
 
 // std
 use std::{
+	borrow::Cow,
 	fmt::{Debug, Formatter, Result as FmtResult},
 	future::Future,
 	hash::Hash,
@@ -44,7 +45,7 @@ pub type SubscriptionId = String;
 ///
 pub type ResponseResult = StdResult<ResponseOk, JsonrpcError>;
 ///
-pub type SubscriptionResult = StdResult<SubscriptionOk, JsonrpcError>;
+pub type SubscriptionResult = StdResult<NotificationOk, JsonrpcError>;
 
 type MessageTx = mpsc::Sender<Message>;
 type MessageRx = mpsc::Receiver<Message>;
@@ -72,61 +73,60 @@ type SubscriptionPool = Pool<SubscriptionId, SubscriptionTx>;
 pub const VERSION: &str = "2.0";
 
 const E_EMPTY_LOCK: &str = "[jsonrpc] acquired `lock` is empty";
+const E_ERROR_CHANNEL_CLOSED: &str = "[jsonrpc] error channel closed";
 const E_INVALID_RESPONSE: &str = "[jsonrpc] unable to process response";
 const E_MESSAGE_CHANNEL_CLOSED: &str = "[jsonrpc] message channel closed";
 const E_NO_ERROR: &str = "[jsonrpc] no error to report";
-const E_REPORTER_CHANNEL_CLOSED: &str = "[jsonrpc] reporter channel closed";
+const E_RESPONSE_CHANNEL_CLOSED: &str = "[jsonrpc] response channel closed";
 const E_TX_NOT_FOUND: &str = "[jsonrpc] tx not found in the pool";
 
 ///
 #[async_trait::async_trait]
 pub trait Initialize {
 	///
-	type Connection;
+	type Protocol;
 
 	///
-	async fn initialize(self) -> Result<Self::Connection>;
+	async fn initialize(self) -> Result<Self::Protocol>;
 }
 #[async_trait::async_trait]
 impl<'a> Initialize for WsInitializer<'a> {
-	type Connection = Ws;
+	type Protocol = Ws;
 
-	async fn initialize(self) -> Result<Self::Connection> {
+	async fn initialize(self) -> Result<Self::Protocol> {
 		self.initialize().await
 	}
 }
 
 ///
-pub trait IntoRequestRaw<'a>: Send + Into<RequestRaw<'a, Value>> {}
-impl<'a, T> IntoRequestRaw<'a> for T where T: Send + Into<RequestRaw<'a, Value>> {}
+pub trait IntoRequestRaw<T>: Send + Into<RequestRaw<T>> {}
+impl<M, T> IntoRequestRaw<M> for T where T: Send + Into<RequestRaw<M>> {}
 
 ///
 #[async_trait::async_trait]
-pub trait Jsonrpc: Sized {
+pub trait Jsonrpc: Sync + Send {
 	/// Send a single request.
-	async fn request<'a, R>(&self, raw_request: R) -> Result<ResponseResult>
+	async fn request<'a, R>(&self, request_raw: R) -> Result<ResponseResult>
 	where
-		R: IntoRequestRaw<'a>;
+		R: IntoRequestRaw<Cow<'a, str>>;
 
 	/// Send a batch of requests.
-	async fn batch<'a, R>(&self, raw_requests: Vec<R>) -> Result<Vec<ResponseResult>>
+	async fn batch<'a, R>(&self, requests_raw: Vec<R>) -> Result<Vec<ResponseResult>>
 	where
-		R: IntoRequestRaw<'a>;
-
-	/// Send a subscription.
-	async fn subscribe<'a, R, M, D>(
-		&self,
-		raw_request: R,
-		unsubscribe_method: M,
-	) -> Result<Subscriber<'a, Self, R, D>>
-	where
-		R: IntoRequestRaw<'a>,
-		M: Send + AsRef<str>;
+		R: IntoRequestRaw<&'a str>;
 }
-
 ///
-pub trait Connection: Send + Sync + Jsonrpc {}
-impl<T> Connection for T where T: Send + Sync + Jsonrpc {}
+#[async_trait::async_trait]
+pub trait JsonrpcExt: Jsonrpc {
+	/// Send a subscription.
+	async fn subscribe<'a, R, D>(
+		&self,
+		request_raw: R,
+		unsubscribe_method: String,
+	) -> Result<Subscriber<D>>
+	where
+		R: IntoRequestRaw<&'a str>;
+}
 
 ///
 pub trait ResultExt {
@@ -186,69 +186,74 @@ pub struct Request<'a, P> {
 /// Raw JSONRPC request.
 #[allow(missing_docs)]
 #[derive(Clone, Debug)]
-pub struct RequestRaw<'a, P> {
-	pub method: &'a str,
-	pub params: P,
+pub struct RequestRaw<T> {
+	pub method: T,
+	pub params: Value,
 }
-impl<'a, P> From<(&'a str, P)> for RequestRaw<'a, P> {
-	fn from(raw: (&'a str, P)) -> Self {
-		Self { method: raw.0, params: raw.1 }
+impl<T> From<(T, Value)> for RequestRaw<T> {
+	fn from(v: (T, Value)) -> Self {
+		Self { method: v.0, params: v.1 }
 	}
 }
 
 /// Generic JSONRPC response result.
 #[allow(missing_docs)]
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ResponseOk {
 	pub jsonrpc: String,
 	pub id: Id,
 	pub result: Value,
 }
+impl Debug for ResponseOk {
+	fn fmt(&self, f: &mut Formatter) -> FmtResult {
+		write!(
+			f,
+			"ResponseOk {{ jsonrpc: {}, id: {}, result: {} }}",
+			self.jsonrpc, self.id, self.result
+		)
+	}
+}
 
 /// Generic JSONRPC error.
 #[allow(missing_docs)]
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct JsonrpcError {
 	pub jsonrpc: String,
 	pub id: Id,
 	pub error: Value,
 }
+impl Debug for JsonrpcError {
+	fn fmt(&self, f: &mut Formatter) -> FmtResult {
+		write!(
+			f,
+			"JsonrpcError {{ jsonrpc: {}, id: {}, error: {} }}",
+			self.jsonrpc, self.id, self.error
+		)
+	}
+}
 
 /// Generic JSONRPC notification.
 #[allow(missing_docs)]
 #[derive(Clone, Debug, Deserialize)]
-pub struct SubscriptionOk {
+pub struct NotificationOk {
 	pub jsonrpc: String,
 	pub method: String,
-	pub params: Value,
+	pub params: NotificationParams,
 }
-
-///
-#[derive(Debug)]
-pub struct Subscriber<'a, J, R, D>
-where
-	J: Jsonrpc,
-	R: IntoRequestRaw<'a>,
-{
-	unsubscribe_fut: UnsubscribeFut<'a, J, R>,
-	subscription_rx: SubscriptionRx,
-	_deserialize: D,
+/// Generic JSONRPC notification params.
+#[allow(missing_docs)]
+#[derive(Clone, Deserialize)]
+pub struct NotificationParams {
+	subscription: SubscriptionId,
+	result: Value,
 }
-struct UnsubscribeFut<'a, J, R>
-where
-	J: Jsonrpc,
-	R: IntoRequestRaw<'a>,
-{
-	f: Box<dyn FnOnce(&J, R) -> Pin<Box<dyn Future<Output = ()>>>>,
-	_lifetime: PhantomData<&'a ()>,
-}
-impl<'a, J, R> Debug for UnsubscribeFut<'a, J, R>
-where
-	J: Jsonrpc,
-	R: IntoRequestRaw<'a>,
-{
+impl Debug for NotificationParams {
 	fn fmt(&self, f: &mut Formatter) -> FmtResult {
-		write!(f, "UnsubscribeFut")
+		write!(
+			f,
+			"NotificationParams {{ subscription: {}, result: {} }}",
+			self.subscription, self.result
+		)
 	}
 }
 
@@ -308,7 +313,8 @@ enum Message {
 	Debug(Id),
 	Request(Call<ResponseResult>),
 	Batch(Call<Vec<ResponseResult>>),
-	Subscription(Subscription),
+	Subscribe(Subscription),
+	Unsubscribe(SubscriptionId),
 }
 // A single request object.
 // `id`: Request Id.
@@ -354,20 +360,24 @@ impl Pools {
 		match first {
 			b'{' =>
 				if let Ok(o) = serde_json::from_slice::<ResponseOk>(r) {
-					self.requests.take_tx(&o.id).send(Ok(Ok(o))).expect(E_MESSAGE_CHANNEL_CLOSED);
+					self.requests.take_tx(&o.id).send(Ok(Ok(o))).expect(E_RESPONSE_CHANNEL_CLOSED);
 
 					return Ok(());
 				} else if let Ok(e) = serde_json::from_slice::<JsonrpcError>(r) {
 					// E.g.
 					// ```
-					// Response({"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":2})
+					// {"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":2}
 					// ```
 
-					self.requests.take_tx(&e.id).send(Ok(Err(e))).expect(E_MESSAGE_CHANNEL_CLOSED);
+					self.requests.take_tx(&e.id).send(Ok(Err(e))).expect(E_RESPONSE_CHANNEL_CLOSED);
 
 					return Ok(());
-				} else if let Ok(o) = serde_json::from_slice::<SubscriptionOk>(r) {
-					dbg!(o);
+				} else if let Ok(o) = serde_json::from_slice::<NotificationOk>(r) {
+					self.subscriptions
+						.take_tx(&o.params.subscription)
+						.send(Ok(o))
+						.await
+						.expect(E_RESPONSE_CHANNEL_CLOSED);
 
 					return Ok(());
 				},
@@ -389,7 +399,7 @@ impl Pools {
 					self.batches
 						.take_tx(&r.first().ok_or(error::Jsonrpc::EmptyBatch)?.id())
 						.send(Ok(r))
-						.expect(E_MESSAGE_CHANNEL_CLOSED);
+						.expect(E_RESPONSE_CHANNEL_CLOSED);
 
 					return Ok(());
 				},

@@ -6,7 +6,7 @@ pub mod prelude {
 	pub use crate::apeye::{
 		api::{Argument, Deserialization, Parameter},
 		runtime::Runtime,
-		Layer,
+		Layer, LayerExt,
 	};
 }
 
